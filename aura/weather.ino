@@ -27,6 +27,8 @@
 #define LOCATION_DEFAULT "London"
 #define DEFAULT_CAPTIVE_SSID "Aura"
 #define UPDATE_INTERVAL 600000UL  // 10 minutes
+#define CONFIG_PORTAL_TIMEOUT_S 300  // reboot and retry saved Wi-Fi if nobody configures the portal
+#define WIFI_RECONNECT_TIMEOUT_MS 15000
 
 // Night mode starts at 10pm and ends at 6am
 #define NIGHT_MODE_START_HOUR 22
@@ -75,8 +77,9 @@ static char latitude[16] = LATITUDE_DEFAULT;
 static char longitude[16] = LONGITUDE_DEFAULT;
 static String location = String(LOCATION_DEFAULT);
 static char dd_opts[512];
-static DynamicJsonDocument geoDoc(8 * 1024);
+static JsonDocument geoDoc;
 static JsonArray geoResults;
+static char ap_password[9];
 
 // Screen dimming variables
 static bool night_mode_active = false;
@@ -186,6 +189,7 @@ void handle_temp_screen_wakeup_timeout(lv_timer_t *timer);
 
 int day_of_week(int y, int m, int d) {
   static const int t[] = { 0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4 };
+  if (m < 1 || m > 12) return 0;
   if (m < 3) y -= 1;
   return (y + y / 4 - y / 100 + y / 400 + t[m - 1] + d) % 7;
 }
@@ -234,7 +238,7 @@ static void update_clock(lv_timer_t *timer) {
 
   check_for_night_mode();
 
-  if (!getLocalTime(&timeinfo)) return;
+  if (!getLocalTime(&timeinfo, 0)) return;
 
   const LocalizedStrings* strings = get_strings(current_language);
   char buf[16];
@@ -322,6 +326,7 @@ void setup() {
   pinMode(LCD_BACKLIGHT_PIN, OUTPUT);
 
   lv_init();
+  lv_tick_set_cb([]() -> uint32_t { return millis(); });
 
   // Init touchscreen
   touchscreenSPI.begin(XPT2046_CLK, XPT2046_MISO, XPT2046_MOSI, XPT2046_CS);
@@ -348,9 +353,22 @@ void setup() {
   analogWrite(LCD_BACKLIGHT_PIN, brightness);
 
   // Check for Wi-Fi config and request it if not available
+  generate_ap_password();
   WiFiManager wm;
   wm.setAPCallback(apModeCallback);
-  wm.autoConnect(DEFAULT_CAPTIVE_SSID);
+  wm.setConfigPortalTimeout(CONFIG_PORTAL_TIMEOUT_S);
+  // Registered before WiFiManager's own routes, so these take precedence and
+  // nobody on the open setup network can push firmware through the portal.
+  wm.setWebServerCallback([&wm]() {
+    wm.server->on("/update", [&wm]() { wm.server->send(403, "text/plain", "Firmware upload disabled"); });
+    wm.server->on("/u", [&wm]() { wm.server->send(403, "text/plain", "Firmware upload disabled"); });
+  });
+  std::vector<const char *> menu = {"wifi", "info", "sep", "restart", "exit"};
+  wm.setMenu(menu);
+  if (!wm.autoConnect(DEFAULT_CAPTIVE_SSID, ap_password)) {
+    Serial.println("Config portal timed out without Wi-Fi; rebooting to retry.");
+    esp_restart();
+  }
 
   lv_timer_create(update_clock, 1000, NULL);
 
@@ -381,8 +399,16 @@ void loop() {
     last = millis();
   }
 
-  lv_tick_inc(5);
   delay(5);
+}
+
+void generate_ap_password() {
+  // No 0/o/1/l so it's easy to read off the screen
+  static const char charset[] = "abcdefghijkmnpqrstuvwxyz23456789";
+  for (int i = 0; i < 8; i++) {
+    ap_password[i] = charset[esp_random() % (sizeof(charset) - 1)];
+  }
+  ap_password[8] = '\0';
 }
 
 void wifi_splash_screen() {
@@ -399,6 +425,11 @@ void wifi_splash_screen() {
   lv_obj_set_style_text_font(lbl, get_font_14(), LV_PART_MAIN | LV_STATE_DEFAULT);
   lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, 0);
   lv_obj_center(lbl);
+
+  lv_obj_t *lbl_pw = lv_label_create(scr);
+  lv_label_set_text_fmt(lbl_pw, "Password: %s", ap_password);
+  lv_obj_set_style_text_font(lbl_pw, get_font_20(), LV_PART_MAIN | LV_STATE_DEFAULT);
+  lv_obj_align(lbl_pw, LV_ALIGN_BOTTOM_MID, 0, -20);
   lv_scr_load(scr);
 }
 
@@ -526,13 +557,15 @@ void create_ui() {
 void populate_results_dropdown() {
   dd_opts[0] = '\0';
   for (JsonObject item : geoResults) {
-    strcat(dd_opts, item["name"].as<const char *>());
+    const char *name = item["name"];
+    if (!name) name = "?";
+    strlcat(dd_opts, name, sizeof(dd_opts));
     if (item["admin1"]) {
-      strcat(dd_opts, ", ");
-      strcat(dd_opts, item["admin1"].as<const char *>());
+      strlcat(dd_opts, ", ", sizeof(dd_opts));
+      strlcat(dd_opts, item["admin1"].as<const char *>(), sizeof(dd_opts));
     }
 
-    strcat(dd_opts, "\n");
+    strlcat(dd_opts, "\n", sizeof(dd_opts));
   }
 
   if (geoResults.size() > 0) {
@@ -548,8 +581,10 @@ void populate_results_dropdown() {
 static void location_save_event_cb(lv_event_t *e) {
   JsonArray *pres = static_cast<JsonArray *>(lv_event_get_user_data(e));
   uint16_t idx = lv_dropdown_get_selected(results_dd);
+  if (pres->isNull() || idx >= pres->size()) return;
 
   JsonObject obj = (*pres)[idx];
+  if (!obj["latitude"].is<double>() || !obj["longitude"].is<double>()) return;
   double lat = obj["latitude"].as<double>();
   double lon = obj["longitude"].as<double>();
 
@@ -918,6 +953,7 @@ static void settings_event_handler(lv_event_t *e) {
     
     // Recreate the main UI with the new language
     lv_obj_clean(lv_scr_act());
+    kb = nullptr;  // was a child of the screen, so lv_obj_clean deleted it
     create_ui();
     fetch_and_update_weather();
     return;
@@ -941,10 +977,10 @@ static void settings_event_handler(lv_event_t *e) {
 
 // Screen dimming functions implementation
 bool night_mode_should_be_active() {
-  struct tm timeinfo;
-  if (!getLocalTime(&timeinfo)) return false;
-
   if (!use_night_mode) return false;
+
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo, 0)) return false;
   
   int hour = timeinfo.tm_hour;
   return (hour >= NIGHT_MODE_START_HOUR || hour < NIGHT_MODE_END_HOUR);
@@ -985,17 +1021,61 @@ void handle_temp_screen_wakeup_timeout(lv_timer_t *timer) {
   }
 }
 
-void do_geocode_query(const char *q) {
-  geoDoc.clear();
-  String url = String("https://geocoding-api.open-meteo.com/v1/search?name=") + urlencode(q) + "&count=15";
+void log_heap(const char *where) {
+  Serial.printf("[heap] %s: free=%u largest_block=%u min_ever=%u\n", where,
+                ESP.getFreeHeap(), ESP.getMaxAllocHeap(), ESP.getMinFreeHeap());
+}
 
+// Reconnects using the saved credentials. Never opens the config portal: that
+// would block the UI indefinitely and expose an access point on every router blip.
+bool ensure_wifi() {
+  if (WiFi.status() == WL_CONNECTED) return true;
+
+  Serial.println("WiFi no longer connected. Attempting to reconnect...");
+  WiFi.reconnect();
+  uint32_t start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_RECONNECT_TIMEOUT_MS) {
+    lv_timer_handler();
+    delay(50);
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi connection still unavailable.");
+    return false;
+  }
+  Serial.println("WiFi connection reestablished.");
+  return true;
+}
+
+void do_geocode_query(const char *q) {
+  // Drop any previous results first so Save can't act on a stale or freed array
+  geoResults = JsonArray();
+  geoDoc.clear();
+  lv_dropdown_set_options(results_dd, "");
+  lv_obj_clear_flag(results_dd, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_set_style_bg_color(btn_close_loc, lv_palette_main(LV_PALETTE_GREY), LV_PART_MAIN | LV_STATE_DEFAULT);
+  lv_obj_clear_flag(btn_close_loc, LV_OBJ_FLAG_CLICKABLE);
+
+  if (!ensure_wifi()) return;
+
+  String url = String("https://geocoding-api.open-meteo.com/v1/search?name=") + urlencode(q) + "&count=10";
+
+  JsonDocument filter;
+  JsonObject f = filter["results"].add<JsonObject>();
+  f["name"] = true;
+  f["admin1"] = true;
+  f["country_code"] = true;
+  f["latitude"] = true;
+  f["longitude"] = true;
+
+  log_heap("before geocode");
   NetworkClientSecure client;
   client.setCACert(OPEN_METEO_ROOT_CA);
   HTTPClient http;
+  http.useHTTP10(true);  // no chunked encoding, so the stream can be parsed directly
   http.begin(client, url);
   if (http.GET() == HTTP_CODE_OK) {
     Serial.println("Completed location search at open-meteo: " + url);
-    auto err = deserializeJson(geoDoc, http.getString());
+    auto err = deserializeJson(geoDoc, http.getStream(), DeserializationOption::Filter(filter));
     if (!err) {
       geoResults = geoDoc["results"].as<JsonArray>();
       populate_results_dropdown();
@@ -1009,18 +1089,7 @@ void do_geocode_query(const char *q) {
 }
 
 void fetch_and_update_weather() {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi no longer connected. Attempting to reconnect...");
-    WiFi.disconnect();
-    WiFiManager wm;  
-    wm.autoConnect(DEFAULT_CAPTIVE_SSID);
-    delay(1000);  
-    if (WiFi.status() != WL_CONNECTED) { 
-      Serial.println("WiFi connection still unavailable.");
-      return;   
-    }
-    Serial.println("WiFi connection reestablished.");
-  }
+  if (!ensure_wifi()) return;
 
 
   String url = String("https://api.open-meteo.com/v1/forecast?latitude=")
@@ -1031,18 +1100,30 @@ void fetch_and_update_weather() {
                + "&forecast_hours=7"
                + "&timezone=auto";
 
+  log_heap("before weather fetch");
   NetworkClientSecure client;
   client.setCACert(OPEN_METEO_ROOT_CA);
   HTTPClient http;
+  http.useHTTP10(true);  // no chunked encoding, so the stream can be parsed directly
   http.begin(client, url);
 
   if (http.GET() == HTTP_CODE_OK) {
     Serial.println("Updated weather from open-meteo: " + url);
 
-    String payload = http.getString();
-    DynamicJsonDocument doc(32 * 1024);
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, http.getStream());
+    log_heap("after weather parse");
 
-    if (deserializeJson(doc, payload) == DeserializationError::Ok) {
+    JsonArray times = doc["daily"]["time"].as<JsonArray>();
+    JsonArray hours = doc["hourly"]["time"].as<JsonArray>();
+    bool complete = times.size() >= 7 && hours.size() >= 7;
+    for (int i = 0; complete && i < 7; i++) {
+      const char *d = times[i];
+      const char *h = hours[i];
+      complete = d && strlen(d) >= 10 && h && strlen(h) >= 16;
+    }
+
+    if (err == DeserializationError::Ok && complete) {
       float t_now = doc["current"]["temperature_2m"].as<float>();
       float t_ap = doc["current"]["apparent_temperature"].as<float>();
       int code_now = doc["current"]["weather_code"].as<int>();
@@ -1064,7 +1145,6 @@ void fetch_and_update_weather() {
       lv_label_set_text_fmt(lbl_today_feels_like, "%s %.0f°%c", strings->feels_like_temp, t_ap, unit);
       lv_img_set_src(img_today_icon, choose_image(code_now, is_day));
 
-      JsonArray times = doc["daily"]["time"].as<JsonArray>();
       JsonArray tmin = doc["daily"]["temperature_2m_min"].as<JsonArray>();
       JsonArray tmax = doc["daily"]["temperature_2m_max"].as<JsonArray>();
       JsonArray weather_codes = doc["daily"]["weather_code"].as<JsonArray>();
@@ -1090,7 +1170,6 @@ void fetch_and_update_weather() {
         lv_img_set_src(img_daily[i], choose_icon(weather_codes[i].as<int>(), (i == 0) ? is_day : 1));
       }
 
-      JsonArray hours = doc["hourly"]["time"].as<JsonArray>();
       JsonArray hourly_temps = doc["hourly"]["temperature_2m"].as<JsonArray>();
       JsonArray precipitation_probabilities = doc["hourly"]["precipitation_probability"].as<JsonArray>();
       JsonArray hourly_weather_codes = doc["hourly"]["weather_code"].as<JsonArray>();
@@ -1120,7 +1199,7 @@ void fetch_and_update_weather() {
 
 
     } else {
-      Serial.println("JSON parse failed on result from " + url);
+      Serial.printf("Unusable weather response (%s) from %s\n", err.c_str(), url.c_str());
     }
   } else {
     Serial.println("HTTP GET failed at " + url);
