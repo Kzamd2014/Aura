@@ -36,6 +36,14 @@ struct LocalizedStrings {
   const char* weekdays[7];
   const char* use_night_mode;
   const char* updated;
+  const char* current_conditions;
+  const char* wind;
+  const char* gusts;
+  const char* humidity;
+  const char* uv_index;
+  const char* sunrise;
+  const char* sunset;
+  const char* precip_today;
 };
 
 #define DEFAULT_CAPTIVE_SSID "Aura"
@@ -67,7 +75,8 @@ static const LocalizedStrings strings_en = {
   "Language:",
   {"Sun", "Mon", "Tues", "Wed", "Thurs", "Fri", "Sat"},
   "Dim screen at night",
-  "Updated"
+  "Updated",
+  "CURRENT CONDITIONS", "Wind", "Gusts", "Humidity", "UV index", "Sunrise", "Sunset", "Precip. today"
 };
 
 static const LocalizedStrings strings_es = {
@@ -99,7 +108,8 @@ static const LocalizedStrings strings_es = {
   "Idioma:",
   {"Dom", "Lun", "Mar", "Mié", "Jue", "Vie", "Sáb"},
   "Pantalla noche",
-  "Actualizado"
+  "Actualizado",
+  "CONDICIONES ACTUALES", "Viento", "Ráfagas", "Humedad", "Índice UV", "Amanecer", "Atardecer", "Precip. hoy"
 };
 
 static const LocalizedStrings strings_de = {
@@ -133,7 +143,8 @@ static const LocalizedStrings strings_de = {
   "Sprache:",
   {"So", "Mo", "Di", "Mi", "Do", "Fr", "Sa"},
   "Nacht-Dimmen",
-  "Aktualisiert"
+  "Aktualisiert",
+  "AKTUELLES WETTER", "Wind", "Böen", "Luftfeuchte", "UV-Index", "Sonnenaufgang", "Sonnenuntergang", "Niederschlag"
 };
 
 static const LocalizedStrings strings_fr = {
@@ -167,7 +178,8 @@ static const LocalizedStrings strings_fr = {
   "Langue:",
   {"Dim", "Lun", "Mar", "Mer", "Jeu", "Ven", "Sam"},
   "Nuit écran",
-  "Mis à jour"
+  "Mis à jour",
+  "CONDITIONS ACTUELLES", "Vent", "Rafales", "Humidité", "Indice UV", "Lever du soleil", "Coucher du soleil", "Précip. auj."
 };
 
 static const LocalizedStrings strings_tr = {
@@ -198,7 +210,8 @@ static const LocalizedStrings strings_tr = {
   "Dil:",
   {"Paz", "Pzt", "Sal", "Çar", "Per", "Cum", "Cmt"},
   "Gece kısık",
-  "Güncellendi"
+  "Güncellendi",
+  "MEVCUT KOŞULLAR", "Rüzgar", "Ani rüzgar", "Nem", "UV indeksi", "Gün doğumu", "Gün batımı", "Yağış bugün"
 };
 
 static const LocalizedStrings strings_sv = {
@@ -233,7 +246,8 @@ static const LocalizedStrings strings_sv = {
   "Sprak:",
   {"Sön", "Man", "Tis", "Ons", "Tor", "Fre", "Lör"},
   "Nattdämpning",
-  "Uppdaterad"
+  "Uppdaterad",
+  "AKTUELLT VÄDER", "Vind", "Vindbyar", "Luftfuktighet", "UV-index", "Soluppgång", "Solnedgång", "Nederbörd idag"
 };
 
 static const LocalizedStrings strings_it = {
@@ -263,7 +277,8 @@ static const LocalizedStrings strings_it = {
   "Lingua:",
   {"Dom", "Lun", "Mar", "Mer", "Gio", "Ven", "Sab"},
   "Schermo notte",
-  "Aggiornato"
+  "Aggiornato",
+  "CONDIZIONI ATTUALI", "Vento", "Raffiche", "Umidità", "Indice UV", "Alba", "Tramonto", "Precip. oggi"
 };
 
 static const LocalizedStrings* get_strings(Language current_language) {

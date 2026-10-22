@@ -118,6 +118,10 @@ static lv_obj_t *lbl_hourly[7];
 static lv_obj_t *lbl_precipitation_probability[7];
 static lv_obj_t *lbl_hourly_temp[7];
 static lv_obj_t *img_hourly[7];
+#define NOW_ROWS 7
+static lv_obj_t *box_now;
+static lv_obj_t *lbl_now_name[NOW_ROWS];
+static lv_obj_t *lbl_now_value[NOW_ROWS];
 static lv_obj_t *lbl_loc;
 static lv_obj_t *loc_ta;
 static lv_obj_t *results_dd;
@@ -197,6 +201,7 @@ bool fetch_weather();
 void create_settings_window();
 static void screen_event_cb(lv_event_t *e);
 static void alert_banner_cb(lv_event_t *e);
+void now_cb(lv_event_t *e);
 static void settings_event_handler(lv_event_t *e);
 const lv_img_dsc_t *choose_image(int wmo_code, int is_day);
 const lv_img_dsc_t *choose_icon(int wmo_code, int is_day);
@@ -611,6 +616,39 @@ void create_ui() {
 
   lv_obj_add_flag(box_hourly, LV_OBJ_FLAG_HIDDEN);
 
+  box_now = lv_obj_create(scr);
+  lv_obj_set_size(box_now, 220, 180);
+  lv_obj_align(box_now, LV_ALIGN_TOP_LEFT, 10, 135);
+  lv_obj_set_style_bg_color(box_now, lv_color_hex(0x5e9bc8), LV_PART_MAIN | LV_STATE_DEFAULT);
+  lv_obj_set_style_bg_opa(box_now, LV_OPA_COVER, LV_PART_MAIN | LV_STATE_DEFAULT);
+  lv_obj_set_style_radius(box_now, 4, LV_PART_MAIN | LV_STATE_DEFAULT);
+  lv_obj_set_style_border_width(box_now, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+  lv_obj_clear_flag(box_now, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_scrollbar_mode(box_now, LV_SCROLLBAR_MODE_OFF);
+  lv_obj_set_style_pad_all(box_now, 10, LV_PART_MAIN);
+  lv_obj_set_style_pad_gap(box_now, 0, LV_PART_MAIN);
+  lv_obj_add_event_cb(box_now, now_cb, LV_EVENT_CLICKED, NULL);
+
+  const char *now_names[NOW_ROWS] = {
+    strings->wind, strings->gusts, strings->humidity, strings->uv_index,
+    strings->precip_today, strings->sunrise, strings->sunset
+  };
+  for (int i = 0; i < NOW_ROWS; i++) {
+    lbl_now_name[i] = lv_label_create(box_now);
+    lv_label_set_text(lbl_now_name[i], now_names[i]);
+    lv_obj_set_style_text_color(lbl_now_name[i], lv_color_hex(0xb9ecff), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_font(lbl_now_name[i], get_font_16(), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_align(lbl_now_name[i], LV_ALIGN_TOP_LEFT, 2, i * 24);
+
+    lbl_now_value[i] = lv_label_create(box_now);
+    lv_label_set_text(lbl_now_value[i], "--");
+    lv_obj_add_style(lbl_now_value[i], &default_label_style, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_font(lbl_now_value[i], get_font_16(), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_align(lbl_now_value[i], LV_ALIGN_TOP_RIGHT, 0, i * 24);
+  }
+
+  lv_obj_add_flag(box_now, LV_OBJ_FLAG_HIDDEN);
+
   // Create clock label in the top-right corner
   lbl_clock = lv_label_create(scr);
   lv_obj_set_style_text_font(lbl_clock, get_font_14(), LV_PART_MAIN | LV_STATE_DEFAULT);
@@ -759,6 +797,13 @@ void daily_cb(lv_event_t *e) {
 void hourly_cb(lv_event_t *e) {
   const LocalizedStrings* strings = get_strings(current_language);
   lv_obj_add_flag(box_hourly, LV_OBJ_FLAG_HIDDEN);
+  lv_label_set_text(lbl_forecast, strings->current_conditions);
+  lv_obj_clear_flag(box_now, LV_OBJ_FLAG_HIDDEN);
+}
+
+void now_cb(lv_event_t *e) {
+  const LocalizedStrings* strings = get_strings(current_language);
+  lv_obj_add_flag(box_now, LV_OBJ_FLAG_HIDDEN);
   lv_label_set_text(lbl_forecast, strings->seven_day_forecast);
   lv_obj_clear_flag(box_daily, LV_OBJ_FLAG_HIDDEN);
 }
@@ -1215,6 +1260,37 @@ void do_geocode_query(const char *q) {
   http.end();
 }
 
+// "2026-10-21T07:34" -> local clock text in the user's 12/24h format
+String format_iso_time(const char *iso, const LocalizedStrings *strings) {
+  if (!iso || strlen(iso) < 16) return "--";
+  int h = atoi(iso + 11), m = atoi(iso + 14);
+  char buf[12];
+  if (use_24_hour) {
+    snprintf(buf, sizeof(buf), "%02d:%02d", h, m);
+  } else {
+    snprintf(buf, sizeof(buf), "%d:%02d%s", h % 12 ? h % 12 : 12, m, h < 12 ? strings->am : strings->pm);
+  }
+  return String(buf);
+}
+
+void update_now_values(JsonDocument &doc, const LocalizedStrings *strings) {
+  JsonObject cur = doc["current"];
+  JsonObject daily = doc["daily"];
+  const char *speed = use_fahrenheit ? "mph" : "km/h";
+
+  lv_label_set_text_fmt(lbl_now_value[0], "%.0f %s", cur["wind_speed_10m"] | 0.0f, speed);
+  lv_label_set_text_fmt(lbl_now_value[1], "%.0f %s", cur["wind_gusts_10m"] | 0.0f, speed);
+  lv_label_set_text_fmt(lbl_now_value[2], "%d%%", cur["relative_humidity_2m"] | 0);
+  lv_label_set_text_fmt(lbl_now_value[3], "%.0f", cur["uv_index"] | 0.0f);
+  if (use_fahrenheit) {
+    lv_label_set_text_fmt(lbl_now_value[4], "%.2f in", daily["precipitation_sum"][0] | 0.0f);
+  } else {
+    lv_label_set_text_fmt(lbl_now_value[4], "%.1f mm", daily["precipitation_sum"][0] | 0.0f);
+  }
+  lv_label_set_text(lbl_now_value[5], format_iso_time(daily["sunrise"][0], strings).c_str());
+  lv_label_set_text(lbl_now_value[6], format_iso_time(daily["sunset"][0], strings).c_str());
+}
+
 void fetch_and_update_weather() {
   if (fetch_weather()) {
     last_weather_success_ms = millis();
@@ -1310,7 +1386,10 @@ bool fetch_weather() {
   String url = String("https://api.open-meteo.com/v1/forecast?latitude=")
                + latitude + "&longitude=" + longitude
                + "&current=temperature_2m,apparent_temperature,is_day,weather_code"
+               + ",relative_humidity_2m,wind_speed_10m,wind_gusts_10m,uv_index"
                + "&daily=temperature_2m_min,temperature_2m_max,weather_code"
+               + ",sunrise,sunset,precipitation_sum"
+               + (use_fahrenheit ? "&wind_speed_unit=mph&precipitation_unit=inch" : "")
                + "&hourly=temperature_2m,precipitation_probability,is_day,weather_code"
                + "&forecast_hours=7"
                + "&timezone=auto";
@@ -1411,6 +1490,7 @@ bool fetch_weather() {
         lv_label_set_text_fmt(lbl_hourly_temp[i], "%.0f°%c", temp, unit);
         lv_img_set_src(img_hourly[i], choose_icon(hourly_weather_codes[i].as<int>(), hourly_is_day[i].as<int>()));
       }
+      update_now_values(doc, strings);
       ok = true;
 
 
