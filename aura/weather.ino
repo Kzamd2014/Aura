@@ -8,6 +8,9 @@
 #include <TFT_eSPI.h>
 #include <XPT2046_Touchscreen.h>
 #include <Preferences.h>
+#include <LittleFS.h>
+#include <PNGdec.h>
+#include <new>
 #include "esp_system.h"
 #include "translations.h"
 #include "root_ca.h"
@@ -34,7 +37,20 @@
 #define ALERT_INTERVAL 300000UL  // 5 minutes
 #define NWS_USER_AGENT "Aura weather display (github.com/Kzamd2014/Aura)"
 
+// Radar page: IEM NEXRAD composite over a CARTO dark base map, ~270x220 km
+#define RADAR_W 220
+#define RADAR_H 180
+#define RADAR_ZOOM 7
+#define RADAR_INTERVAL 600000UL  // refresh while the radar page is showing
+#define RADAR_PAGE 3
+#define RADAR_FILE "/radar.bin"
+#define RADAR_TMP "/radar.tmp"
+#define BASE_FILE "/base.raw"
+#define BASE_KEY_FILE "/base.key"
+#define DOWNLOAD_FILE "/download.png"
+
 enum AlertLevel { ALERT_NONE, ALERT_MINOR, ALERT_MODERATE, ALERT_SEVERE, ALERT_EXTREME };
+struct RadarWindow { int32_t left, top; };  // top-left in global pixels at RADAR_ZOOM
 
 // Night mode defaults: 10pm to 6am, backlight off
 #define NIGHT_MODE_START_HOUR 22
@@ -105,9 +121,12 @@ static lv_timer_t *temp_screen_wakeup_timer = nullptr;
 static lv_obj_t *lbl_today_temp;
 static lv_obj_t *lbl_today_feels_like;
 static lv_obj_t *img_today_icon;
-#define PAGE_COUNT 3  // 7-day, hourly, current conditions
+#define PAGE_COUNT 4  // 7-day, hourly, current conditions, radar
 static lv_obj_t *forecast_tv;
 static lv_obj_t *page_dots[PAGE_COUNT];
+static lv_obj_t *radar_img;
+static lv_obj_t *lbl_radar_title;
+static uint32_t last_radar_ms = 0;  // 0 = refresh on next view
 static lv_obj_t *lbl_updated;
 static uint32_t last_weather_success_ms = 0;  // 0 = never
 static uint8_t weather_fail_count = 0;
@@ -215,6 +234,7 @@ static void screen_event_cb(lv_event_t *e);
 static void alert_banner_cb(lv_event_t *e);
 void next_page_cb(lv_event_t *e);
 void create_night_dialog();
+void update_radar();
 void update_page_dots();
 static void page_changed_cb(lv_event_t *e);
 static void settings_event_handler(lv_event_t *e);
@@ -397,6 +417,7 @@ void setup() {
   tft.init();
   pinMode(LCD_BACKLIGHT_PIN, OUTPUT);
 
+  if (!LittleFS.begin(true)) Serial.println("LittleFS mount failed; radar disabled");
   lv_init();
   lv_tick_set_cb([]() -> uint32_t { return millis(); });
 
@@ -473,6 +494,11 @@ void loop() {
   if (millis() - last >= (weather_fail_count ? RETRY_INTERVAL : UPDATE_INTERVAL)) {
     fetch_and_update_weather();
     last = millis();
+  }
+
+  if (forecast_tv && current_page() == RADAR_PAGE &&
+      (last_radar_ms == 0 || millis() - last_radar_ms >= RADAR_INTERVAL)) {
+    update_radar();
   }
 
   static uint32_t last_alerts = millis();
@@ -557,7 +583,7 @@ void create_ui() {
   lv_obj_add_event_cb(forecast_tv, page_changed_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
   const char *page_titles[PAGE_COUNT] = {
-    strings->seven_day_forecast, strings->hourly_forecast, strings->current_conditions
+    strings->seven_day_forecast, strings->hourly_forecast, strings->current_conditions, "RADAR"
   };
   lv_obj_t *pages[PAGE_COUNT];
   for (int i = 0; i < PAGE_COUNT; i++) {
@@ -569,6 +595,7 @@ void create_ui() {
     lv_obj_set_style_text_font(title, get_font_12(), LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_color(title, lv_color_hex(0xe4ffff), LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_align(title, LV_ALIGN_TOP_LEFT, 20, 5);
+    if (i == RADAR_PAGE) lbl_radar_title = title;
 
     // Page indicator, fixed on the screen at the right of the heading row
     page_dots[i] = lv_obj_create(scr);
@@ -577,7 +604,7 @@ void create_ui() {
     lv_obj_set_style_border_width(page_dots[i], 0, LV_PART_MAIN);
     lv_obj_set_style_bg_color(page_dots[i], lv_color_hex(0xe4ffff), LV_PART_MAIN);
     lv_obj_clear_flag(page_dots[i], LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_align(page_dots[i], LV_ALIGN_TOP_RIGHT, -14 - (PAGE_COUNT - 1 - i) * 10, 114);
+    lv_obj_align(page_dots[i], LV_ALIGN_TOP_RIGHT, -12 - (PAGE_COUNT - 1 - i) * 9, 114);
   }
   update_page_dots();
 
@@ -672,6 +699,32 @@ void create_ui() {
   lv_obj_set_style_pad_all(box_now, 10, LV_PART_MAIN);
   lv_obj_set_style_pad_gap(box_now, 0, LV_PART_MAIN);
   lv_obj_add_event_cb(box_now, next_page_cb, LV_EVENT_CLICKED, NULL);
+
+  // Radar: drawn by LVGL straight from LittleFS, so no frame buffer in RAM
+  radar_img = lv_image_create(pages[RADAR_PAGE]);
+  lv_obj_set_size(radar_img, RADAR_W, RADAR_H);
+  lv_obj_align(radar_img, LV_ALIGN_TOP_LEFT, 10, 30);
+  lv_obj_set_style_bg_color(radar_img, lv_color_hex(0x262626), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(radar_img, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_add_flag(radar_img, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(radar_img, next_page_cb, LV_EVENT_CLICKED, NULL);
+  if (LittleFS.exists(RADAR_FILE)) lv_image_set_src(radar_img, "L:" RADAR_FILE);
+
+  lv_obj_t *marker = lv_obj_create(radar_img);
+  lv_obj_set_size(marker, 8, 8);
+  lv_obj_set_style_radius(marker, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(marker, lv_color_white(), LV_PART_MAIN);
+  lv_obj_set_style_border_color(marker, lv_color_black(), LV_PART_MAIN);
+  lv_obj_set_style_border_width(marker, 1, LV_PART_MAIN);
+  lv_obj_clear_flag(marker, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_center(marker);
+
+  // CARTO's free basemaps require this credit
+  lv_obj_t *credit = lv_label_create(radar_img);
+  lv_label_set_text(credit, "(c) OSM (c) CARTO");
+  lv_obj_set_style_text_font(credit, get_font_12(), LV_PART_MAIN | LV_STATE_DEFAULT);
+  lv_obj_set_style_text_color(credit, lv_color_hex(0xb0b0b0), LV_PART_MAIN | LV_STATE_DEFAULT);
+  lv_obj_align(credit, LV_ALIGN_BOTTOM_RIGHT, -3, -1);
 
   const char *now_names[NOW_ROWS] = {
     strings->wind, strings->gusts, strings->humidity, strings->uv_index,
@@ -816,6 +869,7 @@ static void location_save_event_cb(lv_event_t *e) {
   lv_label_set_text(lbl_loc, opts.c_str());
   fetch_and_update_weather();
   fetch_alerts();
+  last_radar_ms = 0;
 
   lv_obj_del(location_win);
   location_win = nullptr;
@@ -1427,6 +1481,276 @@ void update_now_values(JsonDocument &doc, const LocalizedStrings *strings) {
   }
   lv_label_set_text(lbl_now_value[5], format_iso_time(daily["sunrise"][0], strings).c_str());
   lv_label_set_text(lbl_now_value[6], format_iso_time(daily["sunset"][0], strings).c_str());
+}
+
+// ---- Radar ----
+
+// The RADAR_W x RADAR_H window of the Web Mercator world map centred on the location
+static RadarWindow radar_window() {
+  double world = 256.0 * (1 << RADAR_ZOOM);
+  double lat = atof(latitude), lon = atof(longitude);
+  double px = (lon + 180.0) / 360.0 * world;
+  double s = sin(lat * M_PI / 180.0);
+  double py = (0.5 - log((1 + s) / (1 - s)) / (4 * M_PI)) * world;
+  return { (int32_t)px - RADAR_W / 2, (int32_t)py - RADAR_H / 2 };
+}
+
+static bool download_to_file(const char *url, const char *ca, const char *path) {
+  NetworkClientSecure client;
+  client.setCACert(ca);
+  HTTPClient http;
+  http.setTimeout(15000);  // IEM renders radar images on demand and can be slow
+  http.begin(client, url);
+  int code = http.GET();
+  bool ok = false;
+  if (code == HTTP_CODE_OK) {
+    File f = LittleFS.open(path, FILE_WRITE);
+    if (f) {
+      int written = http.writeToStream(&f);
+      ok = written > 0;
+      if (!ok) Serial.printf("Download write failed (%d): %s\n", written, url);
+      f.close();
+    }
+  } else {
+    Serial.printf("Download failed (%d): %s\n", code, url);
+  }
+  http.end();
+  return ok;
+}
+
+static File png_file;
+static void *png_open(const char *name, int32_t *size) {
+  png_file = LittleFS.open(name, FILE_READ);
+  if (!png_file) return nullptr;
+  *size = png_file.size();
+  return &png_file;
+}
+static void png_close(void *handle) { png_file.close(); }
+static int32_t png_read(PNGFILE *pf, uint8_t *buf, int32_t len) { return ((File *)pf->fHandle)->read(buf, len); }
+static int32_t png_seek(PNGFILE *pf, int32_t pos) { return ((File *)pf->fHandle)->seek(pos) ? pos : -1; }
+
+struct BaseCtx {
+  PNG *png;
+  File *out;
+  int32_t row0, row1;  // tile rows that fall inside the window
+  int32_t col0, col1;  // tile columns that fall inside the window
+  uint16_t line[256];
+};
+
+// Appends the in-window part of each tile row to that tile's temp file.
+// Writes are strictly sequential: LittleFS rewrites a whole block for every
+// write into the middle of a file, which made stitching in place take >70 s.
+static int base_draw(PNGDRAW *d) {
+  BaseCtx *c = (BaseCtx *)d->pUser;
+  if (d->y < c->row0 || d->y >= c->row1) return 1;
+  c->png->getLineAsRGB565(d, c->line, PNG_RGB565_LITTLE_ENDIAN, 0x00000000);
+  c->out->write((uint8_t *)&c->line[c->col0], (c->col1 - c->col0) * 2);
+  return 1;
+}
+
+static void tile_path(char *buf, size_t len, int tx, int ty) {
+  snprintf(buf, len, "/tile%d%d.raw", tx, ty);
+}
+
+// Builds the window's base map from the CARTO tiles covering it (at most
+// 2x2). Only needed once per location.
+static bool build_base_map(RadarWindow win) {
+  uint32_t start = millis();
+  int32_t tx0 = win.left / 256, tx1 = (win.left + RADAR_W - 1) / 256;
+  int32_t ty0 = win.top / 256, ty1 = (win.top + RADAR_H - 1) / 256;
+
+  // 1. Decode each tile's in-window rectangle into its own file
+  PNG *png = new (std::nothrow) PNG();
+  BaseCtx *ctx = new (std::nothrow) BaseCtx();
+  bool ok = png && ctx;
+  if (ok) ctx->png = png;
+  for (int32_t ty = ty0; ok && ty <= ty1; ty++) {
+    for (int32_t tx = tx0; ok && tx <= tx1; tx++) {
+      char url[96], path[24];
+      snprintf(url, sizeof(url), "https://a.basemaps.cartocdn.com/dark_nolabels/%d/%ld/%ld.png", RADAR_ZOOM, (long)tx, (long)ty);
+      tile_path(path, sizeof(path), tx - tx0, ty - ty0);
+      ok = download_to_file(url, ISRG_ROOT_CAS, DOWNLOAD_FILE) &&
+           png->open(DOWNLOAD_FILE, png_open, png_close, png_read, png_seek, base_draw) == PNG_SUCCESS;
+      if (!ok) break;
+      File out = LittleFS.open(path, FILE_WRITE);
+      ctx->out = &out;
+      ctx->row0 = max(0L, (long)(win.top - ty * 256));
+      ctx->row1 = min(256L, (long)(win.top + RADAR_H - ty * 256));
+      ctx->col0 = max(0L, (long)(win.left - tx * 256));
+      ctx->col1 = min(256L, (long)(win.left + RADAR_W - tx * 256));
+      ok = out && png->decode(ctx, 0) == PNG_SUCCESS;
+      png->close();
+      out.close();
+    }
+  }
+  delete ctx;
+  delete png;
+
+  // 2. Merge the tile pieces row by row into the base map
+  if (ok) {
+    File out = LittleFS.open(BASE_FILE, FILE_WRITE);
+    uint16_t *row = new (std::nothrow) uint16_t[RADAR_W];
+    ok = row != nullptr;
+    File pieces[2];
+    int32_t open_ty = -1;
+    for (int32_t r = 0; ok && r < RADAR_H; r++) {
+      int32_t ty = (win.top + r) / 256;
+      if (ty != open_ty) {  // moved into the next row of tiles
+        for (int32_t tx = tx0; tx <= tx1; tx++) {
+          char path[24];
+          tile_path(path, sizeof(path), tx - tx0, ty - ty0);
+          if (pieces[tx - tx0]) pieces[tx - tx0].close();
+          pieces[tx - tx0] = LittleFS.open(path, FILE_READ);
+          ok = ok && pieces[tx - tx0];
+        }
+        open_ty = ty;
+      }
+      int32_t x = 0;
+      for (int32_t tx = tx0; ok && tx <= tx1; tx++) {
+        int32_t w = min(win.left + RADAR_W, (tx + 1) * 256) - max(win.left, tx * 256);
+        ok = pieces[tx - tx0].read((uint8_t *)&row[x], w * 2) == (size_t)(w * 2);
+        x += w;
+      }
+      if (ok) out.write((uint8_t *)row, RADAR_W * 2);
+    }
+    for (File &f : pieces) if (f) f.close();
+    delete[] row;
+    out.close();
+  }
+  for (int ty = 0; ty < 2; ty++) {
+    for (int tx = 0; tx < 2; tx++) {
+      char path[24];
+      tile_path(path, sizeof(path), tx, ty);
+      LittleFS.remove(path);
+    }
+  }
+  Serial.printf("Radar base map %s in %lu ms\n", ok ? "built" : "failed", millis() - start);
+  return ok;
+}
+
+struct RadarCtx {
+  File *base;
+  File *out;
+  uint16_t line[RADAR_W];
+};
+
+// Alpha-blends one radar row over the matching base map row
+static int radar_draw(PNGDRAW *d) {
+  RadarCtx *c = (RadarCtx *)d->pUser;
+  if (d->y >= RADAR_H) return 1;
+  c->base->seek((size_t)d->y * RADAR_W * 2);
+  c->base->read((uint8_t *)c->line, sizeof(c->line));
+  int w = min(d->iWidth, RADAR_W);
+  for (int x = 0; x < w; x++) {
+    uint8_t r, g, b, a;
+    if (d->iPixelType == PNG_PIXEL_TRUECOLOR_ALPHA && d->iBpp == 8) {
+      const uint8_t *p = &d->pPixels[x * 4];
+      r = p[0]; g = p[1]; b = p[2]; a = p[3];
+    } else if (d->iPixelType == PNG_PIXEL_INDEXED && d->iBpp == 8) {
+      uint8_t i = d->pPixels[x];
+      r = d->pPalette[i * 3]; g = d->pPalette[i * 3 + 1]; b = d->pPalette[i * 3 + 2];
+      a = d->iHasAlpha ? d->pPalette[768 + i] : 255;
+    } else {
+      continue;
+    }
+    if (!a) continue;
+    uint16_t bg = c->line[x];
+    int br = (bg >> 8) & 0xf8, bgg = (bg >> 3) & 0xfc, bb = (bg << 3) & 0xf8;
+    br += (r - br) * a / 255;
+    bgg += (g - bgg) * a / 255;
+    bb += (b - bb) * a / 255;
+    c->line[x] = ((br & 0xf8) << 8) | ((bgg & 0xfc) << 3) | (bb >> 3);
+  }
+  c->out->write((uint8_t *)c->line, sizeof(c->line));
+  return 1;
+}
+
+void update_radar_title() {
+  struct tm tm;
+  if (!lbl_radar_title || !getLocalTime(&tm, 0) || !LittleFS.exists(RADAR_FILE)) return;
+  const LocalizedStrings *strings = get_strings(current_language);
+  if (use_24_hour) {
+    lv_label_set_text_fmt(lbl_radar_title, "RADAR  %02d:%02d", tm.tm_hour, tm.tm_min);
+  } else {
+    int h = tm.tm_hour % 12;
+    lv_label_set_text_fmt(lbl_radar_title, "RADAR  %d:%02d%s", h ? h : 12, tm.tm_min, tm.tm_hour < 12 ? strings->am : strings->pm);
+  }
+}
+
+// Fetches the current NEXRAD composite for the window from IEM's WMS (one
+// exactly-sized image) and composites it over the base map into an LVGL
+// image file.
+void update_radar() {
+  uint32_t start = millis();
+  last_radar_ms = millis();
+  if (!last_radar_ms) last_radar_ms = 1;
+  if (!ensure_wifi()) return;
+
+  RadarWindow win = radar_window();
+  char key[48];
+  snprintf(key, sizeof(key), "%s,%s,%d", latitude, longitude, RADAR_ZOOM);
+  File kf = LittleFS.open(BASE_KEY_FILE, FILE_READ);
+  bool have_base = kf && kf.readString() == key && LittleFS.exists(BASE_FILE);
+  if (kf) kf.close();
+  if (!have_base) {
+    if (!build_base_map(win)) return;
+    kf = LittleFS.open(BASE_KEY_FILE, FILE_WRITE);
+    kf.print(key);
+    kf.close();
+  }
+
+  const double origin = M_PI * 6378137.0;  // half the Web Mercator world width, metres
+  const double res = 2 * origin / (256.0 * (1 << RADAR_ZOOM));
+  char url[400];
+  snprintf(url, sizeof(url),
+           "https://mesonet.agron.iastate.edu/cgi-bin/wms/nexrad/n0q.cgi?SERVICE=WMS&VERSION=1.1.1&REQUEST=GetMap"
+           "&LAYERS=nexrad-n0q-900913&STYLES=&SRS=EPSG:3857&BBOX=%.1f,%.1f,%.1f,%.1f"
+           "&WIDTH=%d&HEIGHT=%d&FORMAT=image/png&TRANSPARENT=true",
+           win.left * res - origin, origin - (win.top + RADAR_H) * res,
+           (win.left + RADAR_W) * res - origin, origin - win.top * res, RADAR_W, RADAR_H);
+
+  log_heap("before radar fetch");
+  if (!download_to_file(url, USERTRUST_ECC_ROOT_CA, DOWNLOAD_FILE)) return;
+
+  File base = LittleFS.open(BASE_FILE, FILE_READ);
+  File out = LittleFS.open(RADAR_TMP, FILE_WRITE);
+  bool ok = base && out;
+  if (ok) {
+    lv_image_header_t header = {};
+    header.magic = LV_IMAGE_HEADER_MAGIC;
+    header.cf = LV_COLOR_FORMAT_RGB565;
+    header.w = RADAR_W;
+    header.h = RADAR_H;
+    header.stride = RADAR_W * 2;
+    out.write((uint8_t *)&header, sizeof(header));
+
+    PNG *png = new (std::nothrow) PNG();
+    RadarCtx *ctx = new (std::nothrow) RadarCtx();
+    log_heap("radar decode");
+    ok = png && ctx;
+    if (ok) {
+      ctx->base = &base;
+      ctx->out = &out;
+    }
+    ok = ok && png->open(DOWNLOAD_FILE, png_open, png_close, png_read, png_seek, radar_draw) == PNG_SUCCESS &&
+         png->getWidth() == RADAR_W && png->getHeight() == RADAR_H &&
+         png->decode(ctx, 0) == PNG_SUCCESS;
+    if (png) png->close();
+    delete ctx;
+    delete png;
+  }
+  if (base) base.close();
+  if (out) out.close();
+
+  if (ok) {
+    LittleFS.remove(RADAR_FILE);
+    LittleFS.rename(RADAR_TMP, RADAR_FILE);
+    lv_image_cache_drop("L:" RADAR_FILE);
+    lv_image_set_src(radar_img, "L:" RADAR_FILE);  // same path: LVGL re-reads the file
+    lv_obj_invalidate(radar_img);
+    update_radar_title();
+  }
+  Serial.printf("Radar update %s in %lu ms\n", ok ? "ok" : "failed", millis() - start);
 }
 
 // US AQI from open-meteo's air quality API, coloured by EPA category
