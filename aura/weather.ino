@@ -37,7 +37,7 @@
 #define ALERT_INTERVAL 300000UL  // 5 minutes
 #define NWS_USER_AGENT "Aura weather display (github.com/Kzamd2014/Aura)"
 
-// Radar page: IEM NEXRAD composite over a CARTO dark base map, ~270x220 km
+// Radar page: RainViewer smoothed radar over IEM county/state lines, ~270x220 km
 #define RADAR_W 220
 #define RADAR_H 180
 #define RADAR_ZOOM 7
@@ -719,9 +719,9 @@ void create_ui() {
   lv_obj_clear_flag(marker, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_center(marker);
 
-  // CARTO's free basemaps require this credit
+  // RainViewer's free API asks for attribution
   lv_obj_t *credit = lv_label_create(radar_img);
-  lv_label_set_text(credit, "(c) OSM (c) CARTO");
+  lv_label_set_text(credit, "RainViewer");
   lv_obj_set_style_text_font(credit, get_font_12(), LV_PART_MAIN | LV_STATE_DEFAULT);
   lv_obj_set_style_text_color(credit, lv_color_hex(0xb0b0b0), LV_PART_MAIN | LV_STATE_DEFAULT);
   lv_obj_align(credit, LV_ALIGN_BOTTOM_RIGHT, -3, -1);
@@ -1495,11 +1495,9 @@ static RadarWindow radar_window() {
   return { (int32_t)px - RADAR_W / 2, (int32_t)py - RADAR_H / 2 };
 }
 
-static bool download_to_file(const char *url, const char *ca, const char *path) {
-  NetworkClientSecure client;
-  client.setCACert(ca);
-  HTTPClient http;
-  http.setTimeout(15000);  // IEM renders radar images on demand and can be slow
+// Uses the caller's client so a run of tiles from one host shares a single
+// keep-alive connection: each TLS handshake costs ~2.5 s on the ESP32.
+static bool download_to_file(HTTPClient &http, NetworkClientSecure &client, const char *url, const char *path) {
   http.begin(client, url);
   int code = http.GET();
   bool ok = false;
@@ -1529,51 +1527,94 @@ static void png_close(void *handle) { png_file.close(); }
 static int32_t png_read(PNGFILE *pf, uint8_t *buf, int32_t len) { return ((File *)pf->fHandle)->read(buf, len); }
 static int32_t png_seek(PNGFILE *pf, int32_t pos) { return ((File *)pf->fHandle)->seek(pos) ? pos : -1; }
 
-struct BaseCtx {
-  PNG *png;
+// Decodes the in-window rectangle of one 256x256 map tile into a piece file,
+// one row after another: 1 byte/pixel (alpha only) for base map line layers,
+// or 4 bytes/pixel (RGBA) for radar. Writes are strictly sequential:
+// LittleFS rewrites a whole block for every write into the middle of a file,
+// which made stitching in place take over 70 s.
+struct PieceCtx {
   File *out;
-  int32_t row0, row1;  // tile rows that fall inside the window
-  int32_t col0, col1;  // tile columns that fall inside the window
-  uint16_t line[256];
+  bool rgba;
+  int32_t row0, row1, col0, col1;  // in-window part of the tile
+  uint8_t buf[256 * 4];
 };
 
-// Appends the in-window part of each tile row to that tile's temp file.
-// Writes are strictly sequential: LittleFS rewrites a whole block for every
-// write into the middle of a file, which made stitching in place take >70 s.
-static int base_draw(PNGDRAW *d) {
-  BaseCtx *c = (BaseCtx *)d->pUser;
+static void png_pixel(PNGDRAW *d, int x, uint8_t *rgba) {
+  const uint8_t *p = d->pPixels;
+  switch (d->iPixelType) {
+    case PNG_PIXEL_TRUECOLOR_ALPHA:
+      memcpy(rgba, &p[x * 4], 4);
+      return;
+    case PNG_PIXEL_TRUECOLOR:
+      memcpy(rgba, &p[x * 3], 3);
+      rgba[3] = 255;
+      return;
+    case PNG_PIXEL_INDEXED: {
+      int per_byte = 8 / d->iBpp;
+      uint8_t idx = (p[x / per_byte] >> ((per_byte - 1 - x % per_byte) * d->iBpp)) & ((1 << d->iBpp) - 1);
+      memcpy(rgba, &d->pPalette[idx * 3], 3);
+      rgba[3] = d->iHasAlpha ? d->pPalette[768 + idx] : 255;
+      return;
+    }
+    default:  // grayscale tiles aren't used by these services
+      memset(rgba, 0, 4);
+  }
+}
+
+static int piece_draw(PNGDRAW *d) {
+  PieceCtx *c = (PieceCtx *)d->pUser;
   if (d->y < c->row0 || d->y >= c->row1) return 1;
-  c->png->getLineAsRGB565(d, c->line, PNG_RGB565_LITTLE_ENDIAN, 0x00000000);
-  c->out->write((uint8_t *)&c->line[c->col0], (c->col1 - c->col0) * 2);
+  if (d->iBpp != 8 && d->iPixelType != PNG_PIXEL_INDEXED) return 0;  // 16-bit channels unsupported
+  uint8_t px[4];
+  int n = 0;
+  for (int x = c->col0; x < c->col1; x++) {
+    png_pixel(d, x, px);
+    if (c->rgba) {
+      memcpy(&c->buf[n], px, 4);
+      n += 4;
+    } else {
+      c->buf[n++] = px[3];
+    }
+  }
+  c->out->write(c->buf, n);
   return 1;
 }
 
-static void tile_path(char *buf, size_t len, int tx, int ty) {
-  snprintf(buf, len, "/tile%d%d.raw", tx, ty);
+static void piece_path(char *buf, size_t len, const char *kind, int tx, int ty) {
+  snprintf(buf, len, "/%s%d%d.raw", kind, tx, ty);
 }
 
-// Builds the window's base map from the CARTO tiles covering it (at most
-// 2x2). Only needed once per location.
-static bool build_base_map(RadarWindow win) {
-  uint32_t start = millis();
-  int32_t tx0 = win.left / 256, tx1 = (win.left + RADAR_W - 1) / 256;
-  int32_t ty0 = win.top / 256, ty1 = (win.top + RADAR_H - 1) / 256;
-
-  // 1. Decode each tile's in-window rectangle into its own file
+// Downloads each tile covering the window from url_fmt (printf with z, x, y)
+// and decodes it into a piece file. Indices in piece names are relative to the
+// window's first tile, so there are at most 2x2.
+// keep_alive reuses one TLS connection for all tiles. Otherwise requests go
+// out as HTTP/1.0: IEM answers HTTP/1.1 with chunked bodies, which
+// HTTPClient's chunked reader intermittently fails on over TLS.
+static bool fetch_pieces(RadarWindow win, const char *url_fmt, const char *ca, const char *kind, bool rgba, bool keep_alive) {
   PNG *png = new (std::nothrow) PNG();
-  BaseCtx *ctx = new (std::nothrow) BaseCtx();
+  PieceCtx *ctx = new (std::nothrow) PieceCtx();
   bool ok = png && ctx;
-  if (ok) ctx->png = png;
-  for (int32_t ty = ty0; ok && ty <= ty1; ty++) {
-    for (int32_t tx = tx0; ok && tx <= tx1; tx++) {
-      char url[96], path[24];
-      snprintf(url, sizeof(url), "https://a.basemaps.cartocdn.com/dark_nolabels/%d/%ld/%ld.png", RADAR_ZOOM, (long)tx, (long)ty);
-      tile_path(path, sizeof(path), tx - tx0, ty - ty0);
-      ok = download_to_file(url, ISRG_ROOT_CAS, DOWNLOAD_FILE) &&
-           png->open(DOWNLOAD_FILE, png_open, png_close, png_read, png_seek, base_draw) == PNG_SUCCESS;
+  NetworkClientSecure client;
+  client.setCACert(ca);
+  HTTPClient http;
+  http.setReuse(keep_alive);
+  http.useHTTP10(!keep_alive);
+  http.setTimeout(15000);
+  int32_t tx0 = win.left / 256, ty0 = win.top / 256;
+  for (int32_t ty = ty0; ok && ty <= (win.top + RADAR_H - 1) / 256; ty++) {
+    for (int32_t tx = tx0; ok && tx <= (win.left + RADAR_W - 1) / 256; tx++) {
+      char url[200], path[24];
+      snprintf(url, sizeof(url), url_fmt, RADAR_ZOOM, (long)tx, (long)ty);
+      piece_path(path, sizeof(path), kind, tx - tx0, ty - ty0);
+      uint32_t t0 = millis();
+      ok = download_to_file(http, client, url, DOWNLOAD_FILE) ||
+           download_to_file(http, client, url, DOWNLOAD_FILE);  // one retry
+      uint32_t t1 = millis();
+      ok = ok && png->open(DOWNLOAD_FILE, png_open, png_close, png_read, png_seek, piece_draw) == PNG_SUCCESS;
       if (!ok) break;
       File out = LittleFS.open(path, FILE_WRITE);
       ctx->out = &out;
+      ctx->rgba = rgba;
       ctx->row0 = max(0L, (long)(win.top - ty * 256));
       ctx->row1 = min(256L, (long)(win.top + RADAR_H - ty * 256));
       ctx->col0 = max(0L, (long)(win.left - tx * 256));
@@ -1581,94 +1622,121 @@ static bool build_base_map(RadarWindow win) {
       ok = out && png->decode(ctx, 0) == PNG_SUCCESS;
       png->close();
       out.close();
+      Serial.printf("  %s tile: download %lu ms, decode %lu ms\n", kind, t1 - t0, millis() - t1);
     }
   }
   delete ctx;
   delete png;
+  if (!ok) Serial.printf("Fetching %s tiles failed\n", kind);
+  return ok;
+}
 
-  // 2. Merge the tile pieces row by row into the base map
-  if (ok) {
-    File out = LittleFS.open(BASE_FILE, FILE_WRITE);
-    uint16_t *row = new (std::nothrow) uint16_t[RADAR_W];
-    ok = row != nullptr;
-    File pieces[2];
-    int32_t open_ty = -1;
-    for (int32_t r = 0; ok && r < RADAR_H; r++) {
-      int32_t ty = (win.top + r) / 256;
-      if (ty != open_ty) {  // moved into the next row of tiles
-        for (int32_t tx = tx0; tx <= tx1; tx++) {
-          char path[24];
-          tile_path(path, sizeof(path), tx - tx0, ty - ty0);
-          if (pieces[tx - tx0]) pieces[tx - tx0].close();
-          pieces[tx - tx0] = LittleFS.open(path, FILE_READ);
-          ok = ok && pieces[tx - tx0];
-        }
-        open_ty = ty;
+// Reads pieces of one kind back as whole window rows, in order
+struct PieceReader {
+  RadarWindow win;
+  const char *kind;
+  int bpp;
+  File files[2];
+  int32_t open_ty = -1;
+
+  bool read_row(int32_t r, uint8_t *row) {
+    int32_t tx0 = win.left / 256, tx1 = (win.left + RADAR_W - 1) / 256;
+    int32_t ty = (win.top + r) / 256;
+    if (ty != open_ty) {  // moved down into the next row of tiles
+      for (int32_t tx = tx0; tx <= tx1; tx++) {
+        char path[24];
+        piece_path(path, sizeof(path), kind, tx - tx0, ty - win.top / 256);
+        if (files[tx - tx0]) files[tx - tx0].close();
+        files[tx - tx0] = LittleFS.open(path, FILE_READ);
+        if (!files[tx - tx0]) return false;
       }
-      int32_t x = 0;
-      for (int32_t tx = tx0; ok && tx <= tx1; tx++) {
-        int32_t w = min(win.left + RADAR_W, (tx + 1) * 256) - max(win.left, tx * 256);
-        ok = pieces[tx - tx0].read((uint8_t *)&row[x], w * 2) == (size_t)(w * 2);
-        x += w;
-      }
-      if (ok) out.write((uint8_t *)row, RADAR_W * 2);
+      open_ty = ty;
     }
-    for (File &f : pieces) if (f) f.close();
-    delete[] row;
-    out.close();
+    int32_t x = 0;
+    for (int32_t tx = tx0; tx <= tx1; tx++) {
+      int32_t w = min(win.left + RADAR_W, (tx + 1) * 256) - max(win.left, tx * 256);
+      if (files[tx - tx0].read(&row[x * bpp], w * bpp) != (size_t)(w * bpp)) return false;
+      x += w;
+    }
+    return true;
   }
+
+  void close() {
+    for (File &f : files) if (f) f.close();
+  }
+};
+
+static void remove_pieces(const char *kind) {
   for (int ty = 0; ty < 2; ty++) {
     for (int tx = 0; tx < 2; tx++) {
       char path[24];
-      tile_path(path, sizeof(path), tx, ty);
+      piece_path(path, sizeof(path), kind, tx, ty);
       LittleFS.remove(path);
     }
   }
+}
+
+static inline uint16_t rgb565(int r, int g, int b) {
+  return ((r & 0xf8) << 8) | ((g & 0xfc) << 3) | (b >> 3);
+}
+
+static inline uint16_t blend565(uint16_t bg, uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+  int br = (bg >> 8) & 0xf8, bgg = (bg >> 3) & 0xfc, bb = (bg << 3) & 0xf8;
+  return rgb565(br + (r - br) * a / 255, bgg + (g - bgg) * a / 255, bb + (b - bb) * a / 255);
+}
+
+// Builds the window's base map: county and state lines from IEM (US public
+// data, no API key) drawn over a dark background. Only needed per location.
+static bool build_base_map(RadarWindow win) {
+  uint32_t start = millis();
+  static const char *IEM_TILES = "https://mesonet.agron.iastate.edu/c/tile.py/1.0.0/%s/%%d/%%ld/%%ld.png";
+  char counties_fmt[96], states_fmt[96];
+  snprintf(counties_fmt, sizeof(counties_fmt), IEM_TILES, "uscounties");
+  snprintf(states_fmt, sizeof(states_fmt), IEM_TILES, "usstates");
+  bool ok = fetch_pieces(win, counties_fmt, USERTRUST_ECC_ROOT_CA, "cty", false, false) &&
+            fetch_pieces(win, states_fmt, USERTRUST_ECC_ROOT_CA, "st", false, false);
+
+  if (ok) {
+    PieceReader counties{win, "cty", 1}, states{win, "st", 1};
+    uint8_t *ca = new (std::nothrow) uint8_t[RADAR_W];
+    uint8_t *sa = new (std::nothrow) uint8_t[RADAR_W];
+    uint16_t *row = new (std::nothrow) uint16_t[RADAR_W];
+    File out = LittleFS.open(BASE_FILE, FILE_WRITE);
+    ok = ca && sa && row && out;
+    for (int32_t r = 0; ok && r < RADAR_H; r++) {
+      ok = counties.read_row(r, ca) && states.read_row(r, sa);
+      for (int x = 0; ok && x < RADAR_W; x++) {
+        uint16_t px = rgb565(0x1c, 0x24, 0x2e);
+        if (ca[x]) px = blend565(px, 0x3a, 0x46, 0x54, ca[x]);
+        if (sa[x]) px = blend565(px, 0x8a, 0x96, 0xa4, sa[x]);
+        row[x] = px;
+      }
+      if (ok) out.write((uint8_t *)row, RADAR_W * 2);
+    }
+    counties.close();
+    states.close();
+    if (out) out.close();
+    delete[] ca;
+    delete[] sa;
+    delete[] row;
+  }
+  remove_pieces("cty");
+  remove_pieces("st");
   Serial.printf("Radar base map %s in %lu ms\n", ok ? "built" : "failed", millis() - start);
   return ok;
 }
 
-struct RadarCtx {
-  File *base;
-  File *out;
-  uint16_t line[RADAR_W];
-};
-
-// Alpha-blends one radar row over the matching base map row
-static int radar_draw(PNGDRAW *d) {
-  RadarCtx *c = (RadarCtx *)d->pUser;
-  if (d->y >= RADAR_H) return 1;
-  c->base->seek((size_t)d->y * RADAR_W * 2);
-  c->base->read((uint8_t *)c->line, sizeof(c->line));
-  int w = min(d->iWidth, RADAR_W);
-  for (int x = 0; x < w; x++) {
-    uint8_t r, g, b, a;
-    if (d->iPixelType == PNG_PIXEL_TRUECOLOR_ALPHA && d->iBpp == 8) {
-      const uint8_t *p = &d->pPixels[x * 4];
-      r = p[0]; g = p[1]; b = p[2]; a = p[3];
-    } else if (d->iPixelType == PNG_PIXEL_INDEXED && d->iBpp == 8) {
-      uint8_t i = d->pPixels[x];
-      r = d->pPalette[i * 3]; g = d->pPalette[i * 3 + 1]; b = d->pPalette[i * 3 + 2];
-      a = d->iHasAlpha ? d->pPalette[768 + i] : 255;
-    } else {
-      continue;
-    }
-    if (!a) continue;
-    uint16_t bg = c->line[x];
-    int br = (bg >> 8) & 0xf8, bgg = (bg >> 3) & 0xfc, bb = (bg << 3) & 0xf8;
-    br += (r - br) * a / 255;
-    bgg += (g - bgg) * a / 255;
-    bb += (b - bb) * a / 255;
-    c->line[x] = ((br & 0xf8) << 8) | ((bgg & 0xfc) << 3) | (bb >> 3);
-  }
-  c->out->write((uint8_t *)c->line, sizeof(c->line));
-  return 1;
-}
+static time_t radar_frame_time = 0;
 
 void update_radar_title() {
-  struct tm tm;
-  if (!lbl_radar_title || !getLocalTime(&tm, 0) || !LittleFS.exists(RADAR_FILE)) return;
+  if (!lbl_radar_title) return;
+  if (!radar_frame_time || !LittleFS.exists(RADAR_FILE)) {
+    lv_label_set_text(lbl_radar_title, "RADAR");
+    return;
+  }
   const LocalizedStrings *strings = get_strings(current_language);
+  struct tm tm;
+  localtime_r(&radar_frame_time, &tm);
   if (use_24_hour) {
     lv_label_set_text_fmt(lbl_radar_title, "RADAR  %02d:%02d", tm.tm_hour, tm.tm_min);
   } else {
@@ -1677,44 +1745,88 @@ void update_radar_title() {
   }
 }
 
-// Fetches the current NEXRAD composite for the window from IEM's WMS (one
-// exactly-sized image) and composites it over the base map into an LVGL
-// image file.
+// Looks up the newest RainViewer radar frame and returns its tile URL format
+static bool latest_rainviewer_frame(char *url_fmt, size_t len, time_t *frame_time) {
+  JsonDocument filter;
+  filter["host"] = true;
+  JsonObject f = filter["radar"]["past"].add<JsonObject>();
+  f["time"] = true;
+  f["path"] = true;
+
+  NetworkClientSecure client;
+  client.setCACert(ISRG_ROOT_CAS);
+  HTTPClient http;
+  http.useHTTP10(true);
+  http.begin(client, "https://api.rainviewer.com/public/weather-maps.json");
+  bool ok = false;
+  if (http.GET() == HTTP_CODE_OK) {
+    JsonDocument doc;
+    if (!deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter))) {
+      JsonArray past = doc["radar"]["past"];
+      const char *host = doc["host"];
+      if (host && past.size()) {
+        JsonObject last = past[past.size() - 1];
+        const char *path = last["path"];
+        if (path) {
+          // 256px tiles, colour scheme 2, smoothed, snow shown
+          snprintf(url_fmt, len, "%s%s/256/%%d/%%ld/%%ld/2/1_1.png", host, path);
+          *frame_time = last["time"] | 0;
+          ok = true;
+        }
+      }
+    }
+  }
+  http.end();
+  if (!ok) Serial.println("RainViewer frame lookup failed");
+  return ok;
+}
+
+// Fetches the newest smoothed RainViewer radar tiles for the window and
+// composites them over the base map into an LVGL image file.
 void update_radar() {
   uint32_t start = millis();
   last_radar_ms = millis();
   if (!last_radar_ms) last_radar_ms = 1;
   if (!ensure_wifi()) return;
 
+  // The update blocks the UI for several seconds; say so before it starts
+  if (lbl_radar_title) {
+    lv_label_set_text(lbl_radar_title, "RADAR  ...");
+    lv_refr_now(NULL);
+  }
+
   RadarWindow win = radar_window();
   char key[48];
-  snprintf(key, sizeof(key), "%s,%s,%d", latitude, longitude, RADAR_ZOOM);
+  snprintf(key, sizeof(key), "iem:%s,%s,%d", latitude, longitude, RADAR_ZOOM);
   File kf = LittleFS.open(BASE_KEY_FILE, FILE_READ);
   bool have_base = kf && kf.readString() == key && LittleFS.exists(BASE_FILE);
   if (kf) kf.close();
   if (!have_base) {
-    if (!build_base_map(win)) return;
+    if (!build_base_map(win)) {
+      update_radar_title();
+      return;
+    }
     kf = LittleFS.open(BASE_KEY_FILE, FILE_WRITE);
     kf.print(key);
     kf.close();
   }
 
-  const double origin = M_PI * 6378137.0;  // half the Web Mercator world width, metres
-  const double res = 2 * origin / (256.0 * (1 << RADAR_ZOOM));
-  char url[400];
-  snprintf(url, sizeof(url),
-           "https://mesonet.agron.iastate.edu/cgi-bin/wms/nexrad/n0q.cgi?SERVICE=WMS&VERSION=1.1.1&REQUEST=GetMap"
-           "&LAYERS=nexrad-n0q-900913&STYLES=&SRS=EPSG:3857&BBOX=%.1f,%.1f,%.1f,%.1f"
-           "&WIDTH=%d&HEIGHT=%d&FORMAT=image/png&TRANSPARENT=true",
-           win.left * res - origin, origin - (win.top + RADAR_H) * res,
-           (win.left + RADAR_W) * res - origin, origin - win.top * res, RADAR_W, RADAR_H);
-
   log_heap("before radar fetch");
-  if (!download_to_file(url, USERTRUST_ECC_ROOT_CA, DOWNLOAD_FILE)) return;
+  char url_fmt[160];
+  time_t frame_time;
+  if (!latest_rainviewer_frame(url_fmt, sizeof(url_fmt), &frame_time) ||
+      !fetch_pieces(win, url_fmt, ISRG_ROOT_CAS, "rad", true, true)) {
+    remove_pieces("rad");
+    update_radar_title();
+    return;
+  }
 
+  PieceReader radar{win, "rad", 4};
+  uint8_t *rgba = new (std::nothrow) uint8_t[RADAR_W * 4];
+  uint16_t *row = new (std::nothrow) uint16_t[RADAR_W];
   File base = LittleFS.open(BASE_FILE, FILE_READ);
   File out = LittleFS.open(RADAR_TMP, FILE_WRITE);
-  bool ok = base && out;
+  bool ok = rgba && row && base && out;
   if (ok) {
     lv_image_header_t header = {};
     header.magic = LV_IMAGE_HEADER_MAGIC;
@@ -1723,24 +1835,21 @@ void update_radar() {
     header.h = RADAR_H;
     header.stride = RADAR_W * 2;
     out.write((uint8_t *)&header, sizeof(header));
-
-    PNG *png = new (std::nothrow) PNG();
-    RadarCtx *ctx = new (std::nothrow) RadarCtx();
-    log_heap("radar decode");
-    ok = png && ctx;
-    if (ok) {
-      ctx->base = &base;
-      ctx->out = &out;
-    }
-    ok = ok && png->open(DOWNLOAD_FILE, png_open, png_close, png_read, png_seek, radar_draw) == PNG_SUCCESS &&
-         png->getWidth() == RADAR_W && png->getHeight() == RADAR_H &&
-         png->decode(ctx, 0) == PNG_SUCCESS;
-    if (png) png->close();
-    delete ctx;
-    delete png;
   }
+  for (int32_t r = 0; ok && r < RADAR_H; r++) {
+    ok = base.read((uint8_t *)row, RADAR_W * 2) == RADAR_W * 2 && radar.read_row(r, rgba);
+    for (int x = 0; ok && x < RADAR_W; x++) {
+      const uint8_t *p = &rgba[x * 4];
+      if (p[3]) row[x] = blend565(row[x], p[0], p[1], p[2], p[3]);
+    }
+    if (ok) out.write((uint8_t *)row, RADAR_W * 2);
+  }
+  radar.close();
   if (base) base.close();
   if (out) out.close();
+  delete[] rgba;
+  delete[] row;
+  remove_pieces("rad");
 
   if (ok) {
     LittleFS.remove(RADAR_FILE);
@@ -1748,8 +1857,9 @@ void update_radar() {
     lv_image_cache_drop("L:" RADAR_FILE);
     lv_image_set_src(radar_img, "L:" RADAR_FILE);  // same path: LVGL re-reads the file
     lv_obj_invalidate(radar_img);
-    update_radar_title();
+    radar_frame_time = frame_time;
   }
+  update_radar_title();
   Serial.printf("Radar update %s in %lu ms\n", ok ? "ok" : "failed", millis() - start);
 }
 
