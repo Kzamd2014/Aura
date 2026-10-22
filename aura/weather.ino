@@ -534,7 +534,7 @@ void create_ui() {
   lbl_updated = lv_label_create(scr);
   lv_label_set_text(lbl_updated, "");
   lv_obj_set_style_text_font(lbl_updated, get_font_12(), LV_PART_MAIN | LV_STATE_DEFAULT);
-  lv_obj_align(lbl_updated, LV_ALIGN_TOP_RIGHT, -20, 110);
+  lv_obj_align(lbl_updated, LV_ALIGN_TOP_RIGHT, -10, 95);
   update_freshness_label();
 
   box_daily = lv_obj_create(scr);
