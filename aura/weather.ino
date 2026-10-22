@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <WiFiManager.h>
 #include <HTTPClient.h>
+#include <NetworkClientSecure.h>
 #include <ArduinoJson.h>
 #include <time.h>
 #include <lvgl.h>
@@ -9,6 +10,7 @@
 #include <Preferences.h>
 #include "esp_system.h"
 #include "translations.h"
+#include "open_meteo_ca.h"
 
 #define XPT2046_IRQ 36   // T_IRQ
 #define XPT2046_MOSI 32  // T_DIN
@@ -987,8 +989,10 @@ void do_geocode_query(const char *q) {
   geoDoc.clear();
   String url = String("https://geocoding-api.open-meteo.com/v1/search?name=") + urlencode(q) + "&count=15";
 
+  NetworkClientSecure client;
+  client.setCACert(OPEN_METEO_ROOT_CA);
   HTTPClient http;
-  http.begin(url);
+  http.begin(client, url);
   if (http.GET() == HTTP_CODE_OK) {
     Serial.println("Completed location search at open-meteo: " + url);
     auto err = deserializeJson(geoDoc, http.getString());
@@ -1019,7 +1023,7 @@ void fetch_and_update_weather() {
   }
 
 
-  String url = String("http://api.open-meteo.com/v1/forecast?latitude=")
+  String url = String("https://api.open-meteo.com/v1/forecast?latitude=")
                + latitude + "&longitude=" + longitude
                + "&current=temperature_2m,apparent_temperature,is_day,weather_code"
                + "&daily=temperature_2m_min,temperature_2m_max,weather_code"
@@ -1027,8 +1031,10 @@ void fetch_and_update_weather() {
                + "&forecast_hours=7"
                + "&timezone=auto";
 
+  NetworkClientSecure client;
+  client.setCACert(OPEN_METEO_ROOT_CA);
   HTTPClient http;
-  http.begin(url);
+  http.begin(client, url);
 
   if (http.GET() == HTTP_CODE_OK) {
     Serial.println("Updated weather from open-meteo: " + url);
