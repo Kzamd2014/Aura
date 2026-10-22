@@ -31,6 +31,10 @@
 #define WIFI_RECONNECT_TIMEOUT_MS 15000
 #define RETRY_INTERVAL 60000UL  // after a failed fetch
 #define STALE_AFTER_MS (25 * 60 * 1000UL)  // two missed updates
+#define ALERT_INTERVAL 300000UL  // 5 minutes
+#define NWS_USER_AGENT "Aura weather display (github.com/Kzamd2014/Aura)"
+
+enum AlertLevel { ALERT_NONE, ALERT_MINOR, ALERT_MODERATE, ALERT_SEVERE, ALERT_EXTREME };
 
 // Night mode starts at 10pm and ends at 6am
 #define NIGHT_MODE_START_HOUR 22
@@ -96,6 +100,14 @@ static lv_obj_t *lbl_forecast;
 static lv_obj_t *lbl_updated;
 static uint32_t last_weather_success_ms = 0;  // 0 = never
 static uint8_t weather_fail_count = 0;
+
+// Active National Weather Service alerts for the current location (US only)
+static AlertLevel alert_level = ALERT_NONE;
+static String alert_event;
+static String alert_details;
+static int alert_count = 0;
+static lv_obj_t *alert_banner;
+static lv_obj_t *lbl_alert;
 static lv_obj_t *box_daily;
 static lv_obj_t *box_hourly;
 static lv_obj_t *lbl_daily_day[7];
@@ -179,9 +191,12 @@ LV_IMG_DECLARE(image_wintry_mix_rain_snow);
 void create_ui();
 void fetch_and_update_weather();
 void update_freshness_label();
+void fetch_alerts();
+void update_alert_banner();
 bool fetch_weather();
 void create_settings_window();
 static void screen_event_cb(lv_event_t *e);
+static void alert_banner_cb(lv_event_t *e);
 static void settings_event_handler(lv_event_t *e);
 const lv_img_dsc_t *choose_image(int wmo_code, int is_day);
 const lv_img_dsc_t *choose_icon(int wmo_code, int is_day);
@@ -412,6 +427,7 @@ void setup() {
   lv_obj_clean(lv_scr_act());
   create_ui();
   fetch_and_update_weather();
+  fetch_alerts();
 }
 
 void flush_wifi_splashscreen(uint32_t ms = 200) {
@@ -434,6 +450,12 @@ void loop() {
   if (millis() - last >= (weather_fail_count ? RETRY_INTERVAL : UPDATE_INTERVAL)) {
     fetch_and_update_weather();
     last = millis();
+  }
+
+  static uint32_t last_alerts = millis();
+  if (millis() - last_alerts >= ALERT_INTERVAL) {
+    fetch_alerts();
+    last_alerts = millis();
   }
 
   delay(5);
@@ -595,6 +617,66 @@ void create_ui() {
   lv_obj_set_style_text_color(lbl_clock, lv_color_hex(0xb9ecff), LV_PART_MAIN | LV_STATE_DEFAULT);
   lv_label_set_text(lbl_clock, "");
   lv_obj_align(lbl_clock, LV_ALIGN_TOP_RIGHT, -10, 2);
+
+  // Alert banner across the top; covers the clock while an alert is active
+  alert_banner = lv_obj_create(scr);
+  lv_obj_set_size(alert_banner, SCREEN_WIDTH, 24);
+  lv_obj_align(alert_banner, LV_ALIGN_TOP_MID, 0, 0);
+  lv_obj_set_style_radius(alert_banner, 0, LV_PART_MAIN);
+  lv_obj_set_style_border_width(alert_banner, 0, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(alert_banner, 0, LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(alert_banner, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_clear_flag(alert_banner, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_event_cb(alert_banner, alert_banner_cb, LV_EVENT_CLICKED, NULL);
+
+  lbl_alert = lv_label_create(alert_banner);
+  lv_obj_set_width(lbl_alert, SCREEN_WIDTH - 12);
+  lv_label_set_long_mode(lbl_alert, LV_LABEL_LONG_DOT);
+  lv_obj_set_style_text_font(lbl_alert, get_font_14(), LV_PART_MAIN | LV_STATE_DEFAULT);
+  lv_obj_set_style_text_align(lbl_alert, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_center(lbl_alert);
+
+  update_alert_banner();
+}
+
+void update_alert_banner() {
+  if (!alert_banner) return;
+  if (alert_level == ALERT_NONE) {
+    lv_obj_add_flag(alert_banner, LV_OBJ_FLAG_HIDDEN);
+    return;
+  }
+
+  uint32_t bg = 0xd32f2f;  // severe/extreme: red
+  uint32_t fg = 0xffffff;
+  if (alert_level == ALERT_MODERATE) bg = 0xef6c00;  // orange
+  if (alert_level == ALERT_MINOR) { bg = 0xfdd835; fg = 0x202020; }  // yellow
+  lv_obj_set_style_bg_color(alert_banner, lv_color_hex(bg), LV_PART_MAIN);
+  lv_obj_set_style_text_color(lbl_alert, lv_color_hex(fg), LV_PART_MAIN);
+
+  if (alert_count > 1) {
+    lv_label_set_text_fmt(lbl_alert, "%s (+%d)", alert_event.c_str(), alert_count - 1);
+  } else {
+    lv_label_set_text(lbl_alert, alert_event.c_str());
+  }
+  lv_obj_clear_flag(alert_banner, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void alert_banner_cb(lv_event_t *e) {
+  const LocalizedStrings *strings = get_strings(current_language);
+  lv_obj_t *mbox = lv_msgbox_create(lv_scr_act());
+  lv_obj_t *title = lv_msgbox_add_title(mbox, alert_event.c_str());
+  lv_obj_set_style_margin_left(title, 10, 0);
+  lv_obj_set_style_text_font(title, get_font_14(), 0);
+  lv_obj_t *text = lv_msgbox_add_text(mbox, alert_details.c_str());
+  lv_obj_set_style_text_font(text, get_font_12(), 0);
+  lv_msgbox_add_close_button(mbox);
+
+  lv_obj_set_width(mbox, 230);
+  lv_obj_set_style_max_height(mbox, 300, 0);
+  lv_obj_center(mbox);
+  lv_obj_set_style_border_width(mbox, 2, LV_PART_MAIN);
+  lv_obj_set_style_border_color(mbox, lv_color_black(), LV_PART_MAIN);
+  lv_obj_set_style_radius(mbox, 4, LV_PART_MAIN);
 }
 
 void populate_results_dropdown() {
@@ -652,6 +734,7 @@ static void location_save_event_cb(lv_event_t *e) {
   // Re‐fetch weather immediately
   lv_label_set_text(lbl_loc, opts.c_str());
   fetch_and_update_weather();
+  fetch_alerts();
 
   lv_obj_del(location_win);
   location_win = nullptr;
@@ -1021,6 +1104,7 @@ static void settings_event_handler(lv_event_t *e) {
 // Screen dimming functions implementation
 bool night_mode_should_be_active() {
   if (!use_night_mode) return false;
+  if (alert_level >= ALERT_SEVERE) return false;  // keep the screen lit for warnings
 
   struct tm timeinfo;
   if (!getLocalTime(&timeinfo, 0)) return false;
@@ -1140,6 +1224,82 @@ void fetch_and_update_weather() {
     weather_fail_count++;
   }
   update_freshness_label();
+}
+
+static AlertLevel parse_severity(const char *s) {
+  if (!s) return ALERT_MINOR;
+  if (!strcmp(s, "Extreme")) return ALERT_EXTREME;
+  if (!strcmp(s, "Severe")) return ALERT_SEVERE;
+  if (!strcmp(s, "Moderate")) return ALERT_MODERATE;
+  return ALERT_MINOR;
+}
+
+// Polls api.weather.gov for alerts at the saved location. Outside the US the
+// API returns an error, which simply clears the banner.
+void fetch_alerts() {
+  if (!ensure_wifi()) return;
+
+  // NWS redirects points with more than 4 decimal places
+  char url[160];
+  snprintf(url, sizeof(url), "https://api.weather.gov/alerts/active?status=actual&point=%.4f,%.4f",
+           atof(latitude), atof(longitude));
+
+  JsonDocument filter;
+  JsonObject f = filter["features"].add<JsonObject>()["properties"].to<JsonObject>();
+  f["event"] = true;
+  f["severity"] = true;
+  f["headline"] = true;
+
+  log_heap("before alerts fetch");
+  NetworkClientSecure client;
+  client.setCACert(ISRG_ROOT_CAS);
+  HTTPClient http;
+  http.useHTTP10(true);
+  http.setUserAgent(NWS_USER_AGENT);  // required by api.weather.gov
+  http.begin(client, url);
+  int code = http.GET();
+
+  if (code == HTTP_CODE_OK) {
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
+    if (!err) {
+      AlertLevel level = ALERT_NONE;
+      String event, details;
+      int count = 0;
+      for (JsonObject feat : doc["features"].as<JsonArray>()) {
+        JsonObject props = feat["properties"];
+        AlertLevel l = parse_severity(props["severity"]);
+        const char *ev = props["event"] | "Weather alert";
+        if (l > level) {
+          level = l;
+          event = ev;
+        }
+        if (count < 3) {
+          if (details.length()) details += "\n\n";
+          details += props["headline"] | ev;
+        }
+        count++;
+      }
+      if (count > 3) details += "\n\n+" + String(count - 3) + " more";
+
+      alert_level = level;
+      alert_event = event;
+      alert_details = details;
+      alert_count = count;
+      Serial.printf("Alerts from NWS: %d active%s%s\n", count, count ? ", top: " : "", event.c_str());
+    } else {
+      Serial.printf("Alerts parse failed: %s\n", err.c_str());
+    }
+  } else if (code >= 400 && code < 500) {
+    // Location outside NWS coverage
+    alert_level = ALERT_NONE;
+    alert_count = 0;
+    Serial.printf("Alerts unavailable for this location (HTTP %d)\n", code);
+  } else {
+    Serial.printf("Alerts fetch failed (%d); keeping previous state\n", code);
+  }
+  http.end();
+  update_alert_banner();
 }
 
 bool fetch_weather() {
