@@ -96,7 +96,9 @@ static lv_timer_t *temp_screen_wakeup_timer = nullptr;
 static lv_obj_t *lbl_today_temp;
 static lv_obj_t *lbl_today_feels_like;
 static lv_obj_t *img_today_icon;
-static lv_obj_t *lbl_forecast;
+#define PAGE_COUNT 3  // 7-day, hourly, current conditions
+static lv_obj_t *forecast_tv;
+static lv_obj_t *page_dots[PAGE_COUNT];
 static lv_obj_t *lbl_updated;
 static uint32_t last_weather_success_ms = 0;  // 0 = never
 static uint8_t weather_fail_count = 0;
@@ -201,7 +203,9 @@ bool fetch_weather();
 void create_settings_window();
 static void screen_event_cb(lv_event_t *e);
 static void alert_banner_cb(lv_event_t *e);
-void now_cb(lv_event_t *e);
+void next_page_cb(lv_event_t *e);
+void update_page_dots();
+static void page_changed_cb(lv_event_t *e);
 static void settings_event_handler(lv_event_t *e);
 const lv_img_dsc_t *choose_image(int wmo_code, int is_day);
 const lv_img_dsc_t *choose_icon(int wmo_code, int is_day);
@@ -530,11 +534,38 @@ void create_ui() {
   lv_obj_set_style_text_color(lbl_today_feels_like, lv_color_hex(0xe4ffff), LV_PART_MAIN | LV_STATE_DEFAULT);
   lv_obj_align(lbl_today_feels_like, LV_ALIGN_TOP_MID, 45, 75);
 
-  lbl_forecast = lv_label_create(scr);
-  lv_label_set_text(lbl_forecast, strings->seven_day_forecast);
-  lv_obj_set_style_text_font(lbl_forecast, get_font_12(), LV_PART_MAIN | LV_STATE_DEFAULT);
-  lv_obj_set_style_text_color(lbl_forecast, lv_color_hex(0xe4ffff), LV_PART_MAIN | LV_STATE_DEFAULT);
-  lv_obj_align(lbl_forecast, LV_ALIGN_TOP_LEFT, 20, 110);
+  // Swipeable forecast pages below the header; each page has its own heading
+  forecast_tv = lv_tileview_create(scr);
+  lv_obj_set_size(forecast_tv, SCREEN_WIDTH, SCREEN_HEIGHT - 105);
+  lv_obj_align(forecast_tv, LV_ALIGN_TOP_LEFT, 0, 105);
+  lv_obj_set_style_bg_opa(forecast_tv, LV_OPA_TRANSP, LV_PART_MAIN);
+  lv_obj_set_scrollbar_mode(forecast_tv, LV_SCROLLBAR_MODE_OFF);
+  lv_obj_add_event_cb(forecast_tv, page_changed_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+  const char *page_titles[PAGE_COUNT] = {
+    strings->seven_day_forecast, strings->hourly_forecast, strings->current_conditions
+  };
+  lv_obj_t *pages[PAGE_COUNT];
+  for (int i = 0; i < PAGE_COUNT; i++) {
+    pages[i] = lv_tileview_add_tile(forecast_tv, i, 0, (lv_dir_t)((i > 0 ? LV_DIR_LEFT : 0) | (i < PAGE_COUNT - 1 ? LV_DIR_RIGHT : 0)));
+    lv_obj_set_style_bg_opa(pages[i], LV_OPA_TRANSP, LV_PART_MAIN);
+
+    lv_obj_t *title = lv_label_create(pages[i]);
+    lv_label_set_text(title, page_titles[i]);
+    lv_obj_set_style_text_font(title, get_font_12(), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_color(title, lv_color_hex(0xe4ffff), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_align(title, LV_ALIGN_TOP_LEFT, 20, 5);
+
+    // Page indicator, fixed on the screen at the right of the heading row
+    page_dots[i] = lv_obj_create(scr);
+    lv_obj_set_size(page_dots[i], 6, 6);
+    lv_obj_set_style_radius(page_dots[i], LV_RADIUS_CIRCLE, LV_PART_MAIN);
+    lv_obj_set_style_border_width(page_dots[i], 0, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(page_dots[i], lv_color_hex(0xe4ffff), LV_PART_MAIN);
+    lv_obj_clear_flag(page_dots[i], LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_align(page_dots[i], LV_ALIGN_TOP_RIGHT, -14 - (PAGE_COUNT - 1 - i) * 10, 114);
+  }
+  update_page_dots();
 
   lbl_updated = lv_label_create(scr);
   lv_label_set_text(lbl_updated, "");
@@ -542,9 +573,9 @@ void create_ui() {
   lv_obj_align(lbl_updated, LV_ALIGN_TOP_RIGHT, -10, 95);
   update_freshness_label();
 
-  box_daily = lv_obj_create(scr);
+  box_daily = lv_obj_create(pages[0]);
   lv_obj_set_size(box_daily, 220, 180);
-  lv_obj_align(box_daily, LV_ALIGN_TOP_LEFT, 10, 135);
+  lv_obj_align(box_daily, LV_ALIGN_TOP_LEFT, 10, 30);
   lv_obj_set_style_bg_color(box_daily, lv_color_hex(0x5e9bc8), LV_PART_MAIN | LV_STATE_DEFAULT);
   lv_obj_set_style_bg_opa(box_daily, LV_OPA_COVER, LV_PART_MAIN | LV_STATE_DEFAULT);
   lv_obj_set_style_radius(box_daily, 4, LV_PART_MAIN | LV_STATE_DEFAULT);
@@ -553,7 +584,7 @@ void create_ui() {
   lv_obj_set_scrollbar_mode(box_daily, LV_SCROLLBAR_MODE_OFF);
   lv_obj_set_style_pad_all(box_daily, 10, LV_PART_MAIN);
   lv_obj_set_style_pad_gap(box_daily, 0, LV_PART_MAIN);
-  lv_obj_add_event_cb(box_daily, daily_cb, LV_EVENT_CLICKED, NULL);
+  lv_obj_add_event_cb(box_daily, next_page_cb, LV_EVENT_CLICKED, NULL);
 
   for (int i = 0; i < 7; i++) {
     lbl_daily_day[i] = lv_label_create(box_daily);
@@ -578,9 +609,9 @@ void create_ui() {
     lv_obj_align(img_daily[i], LV_ALIGN_TOP_LEFT, 72, i * 24);
   }
 
-  box_hourly = lv_obj_create(scr);
+  box_hourly = lv_obj_create(pages[1]);
   lv_obj_set_size(box_hourly, 220, 180);
-  lv_obj_align(box_hourly, LV_ALIGN_TOP_LEFT, 10, 135);
+  lv_obj_align(box_hourly, LV_ALIGN_TOP_LEFT, 10, 30);
   lv_obj_set_style_bg_color(box_hourly, lv_color_hex(0x5e9bc8), LV_PART_MAIN | LV_STATE_DEFAULT);
   lv_obj_set_style_bg_opa(box_hourly, LV_OPA_COVER, LV_PART_MAIN | LV_STATE_DEFAULT);
   lv_obj_set_style_radius(box_hourly, 4, LV_PART_MAIN | LV_STATE_DEFAULT);
@@ -589,7 +620,7 @@ void create_ui() {
   lv_obj_set_scrollbar_mode(box_hourly, LV_SCROLLBAR_MODE_OFF);
   lv_obj_set_style_pad_all(box_hourly, 10, LV_PART_MAIN);
   lv_obj_set_style_pad_gap(box_hourly, 0, LV_PART_MAIN);
-  lv_obj_add_event_cb(box_hourly, hourly_cb, LV_EVENT_CLICKED, NULL);
+  lv_obj_add_event_cb(box_hourly, next_page_cb, LV_EVENT_CLICKED, NULL);
 
   for (int i = 0; i < 7; i++) {
     lbl_hourly[i] = lv_label_create(box_hourly);
@@ -614,11 +645,10 @@ void create_ui() {
     lv_obj_align(img_hourly[i], LV_ALIGN_TOP_LEFT, 72, i * 24);
   }
 
-  lv_obj_add_flag(box_hourly, LV_OBJ_FLAG_HIDDEN);
 
-  box_now = lv_obj_create(scr);
+  box_now = lv_obj_create(pages[2]);
   lv_obj_set_size(box_now, 220, 180);
-  lv_obj_align(box_now, LV_ALIGN_TOP_LEFT, 10, 135);
+  lv_obj_align(box_now, LV_ALIGN_TOP_LEFT, 10, 30);
   lv_obj_set_style_bg_color(box_now, lv_color_hex(0x5e9bc8), LV_PART_MAIN | LV_STATE_DEFAULT);
   lv_obj_set_style_bg_opa(box_now, LV_OPA_COVER, LV_PART_MAIN | LV_STATE_DEFAULT);
   lv_obj_set_style_radius(box_now, 4, LV_PART_MAIN | LV_STATE_DEFAULT);
@@ -627,7 +657,7 @@ void create_ui() {
   lv_obj_set_scrollbar_mode(box_now, LV_SCROLLBAR_MODE_OFF);
   lv_obj_set_style_pad_all(box_now, 10, LV_PART_MAIN);
   lv_obj_set_style_pad_gap(box_now, 0, LV_PART_MAIN);
-  lv_obj_add_event_cb(box_now, now_cb, LV_EVENT_CLICKED, NULL);
+  lv_obj_add_event_cb(box_now, next_page_cb, LV_EVENT_CLICKED, NULL);
 
   const char *now_names[NOW_ROWS] = {
     strings->wind, strings->gusts, strings->humidity, strings->uv_index,
@@ -647,7 +677,6 @@ void create_ui() {
     lv_obj_align(lbl_now_value[i], LV_ALIGN_TOP_RIGHT, 0, i * 24);
   }
 
-  lv_obj_add_flag(box_now, LV_OBJ_FLAG_HIDDEN);
 
   // Create clock label in the top-right corner
   lbl_clock = lv_label_create(scr);
@@ -787,25 +816,27 @@ void screen_event_cb(lv_event_t *e) {
   create_settings_window();
 }
 
-void daily_cb(lv_event_t *e) {
-  const LocalizedStrings* strings = get_strings(current_language);
-  lv_obj_add_flag(box_daily, LV_OBJ_FLAG_HIDDEN);
-  lv_label_set_text(lbl_forecast, strings->hourly_forecast);
-  lv_obj_clear_flag(box_hourly, LV_OBJ_FLAG_HIDDEN);
+static int current_page() {
+  lv_obj_t *tile = lv_tileview_get_tile_active(forecast_tv);
+  return tile ? lv_obj_get_x(tile) / lv_obj_get_width(forecast_tv) : 0;
 }
 
-void hourly_cb(lv_event_t *e) {
-  const LocalizedStrings* strings = get_strings(current_language);
-  lv_obj_add_flag(box_hourly, LV_OBJ_FLAG_HIDDEN);
-  lv_label_set_text(lbl_forecast, strings->current_conditions);
-  lv_obj_clear_flag(box_now, LV_OBJ_FLAG_HIDDEN);
+void update_page_dots() {
+  int active = current_page();
+  for (int i = 0; i < PAGE_COUNT; i++) {
+    lv_obj_set_style_bg_opa(page_dots[i], i == active ? LV_OPA_COVER : LV_OPA_40, LV_PART_MAIN);
+  }
 }
 
-void now_cb(lv_event_t *e) {
-  const LocalizedStrings* strings = get_strings(current_language);
-  lv_obj_add_flag(box_now, LV_OBJ_FLAG_HIDDEN);
-  lv_label_set_text(lbl_forecast, strings->seven_day_forecast);
-  lv_obj_clear_flag(box_daily, LV_OBJ_FLAG_HIDDEN);
+static void page_changed_cb(lv_event_t *e) {
+  update_page_dots();
+}
+
+// Tapping a forecast box still advances to the next page, wrapping around
+void next_page_cb(lv_event_t *e) {
+  int next = (current_page() + 1) % PAGE_COUNT;
+  lv_tileview_set_tile_by_index(forecast_tv, next, 0, LV_ANIM_ON);
+  update_page_dots();
 }
 
 
