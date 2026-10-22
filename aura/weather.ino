@@ -10,7 +10,7 @@
 #include <Preferences.h>
 #include "esp_system.h"
 #include "translations.h"
-#include "open_meteo_ca.h"
+#include "root_ca.h"
 
 #define XPT2046_IRQ 36   // T_IRQ
 #define XPT2046_MOSI 32  // T_DIN
@@ -29,6 +29,8 @@
 #define UPDATE_INTERVAL 600000UL  // 10 minutes
 #define CONFIG_PORTAL_TIMEOUT_S 300  // reboot and retry saved Wi-Fi if nobody configures the portal
 #define WIFI_RECONNECT_TIMEOUT_MS 15000
+#define RETRY_INTERVAL 60000UL  // after a failed fetch
+#define STALE_AFTER_MS (25 * 60 * 1000UL)  // two missed updates
 
 // Night mode starts at 10pm and ends at 6am
 #define NIGHT_MODE_START_HOUR 22
@@ -91,6 +93,9 @@ static lv_obj_t *lbl_today_temp;
 static lv_obj_t *lbl_today_feels_like;
 static lv_obj_t *img_today_icon;
 static lv_obj_t *lbl_forecast;
+static lv_obj_t *lbl_updated;
+static uint32_t last_weather_success_ms = 0;  // 0 = never
+static uint8_t weather_fail_count = 0;
 static lv_obj_t *box_daily;
 static lv_obj_t *box_hourly;
 static lv_obj_t *lbl_daily_day[7];
@@ -173,6 +178,8 @@ LV_IMG_DECLARE(image_wintry_mix_rain_snow);
 
 void create_ui();
 void fetch_and_update_weather();
+void update_freshness_label();
+bool fetch_weather();
 void create_settings_window();
 static void screen_event_cb(lv_event_t *e);
 static void settings_event_handler(lv_event_t *e);
@@ -233,10 +240,40 @@ String urlencode(const String &str) {
   return encoded;
 }
 
+// Shows when the weather was last fetched; red once it's stale so old data
+// doesn't pass for current.
+void update_freshness_label() {
+  if (!lbl_updated) return;
+  const LocalizedStrings *strings = get_strings(current_language);
+  bool never = last_weather_success_ms == 0;
+  bool stale = never || millis() - last_weather_success_ms > STALE_AFTER_MS;
+
+  char when[12] = "--:--";
+  struct tm tm;
+  if (!never && getLocalTime(&tm, 0)) {
+    time_t t = mktime(&tm) - (millis() - last_weather_success_ms) / 1000;
+    localtime_r(&t, &tm);
+    if (use_24_hour) {
+      snprintf(when, sizeof(when), "%02d:%02d", tm.tm_hour, tm.tm_min);
+    } else {
+      int h = tm.tm_hour % 12;
+      snprintf(when, sizeof(when), "%d:%02d%s", h ? h : 12, tm.tm_min, tm.tm_hour < 12 ? strings->am : strings->pm);
+    }
+  }
+
+  if (never && weather_fail_count == 0) {
+    lv_label_set_text(lbl_updated, "");  // first fetch still in progress
+  } else {
+    lv_label_set_text_fmt(lbl_updated, "%s %s", strings->updated, when);
+  }
+  lv_obj_set_style_text_color(lbl_updated, lv_color_hex(stale ? 0xff6b6b : 0xe4ffff), LV_PART_MAIN | LV_STATE_DEFAULT);
+}
+
 static void update_clock(lv_timer_t *timer) {
   struct tm timeinfo;
 
   check_for_night_mode();
+  update_freshness_label();
 
   if (!getLocalTime(&timeinfo, 0)) return;
 
@@ -394,7 +431,7 @@ void loop() {
   lv_timer_handler();
   static uint32_t last = millis();
 
-  if (millis() - last >= UPDATE_INTERVAL) {
+  if (millis() - last >= (weather_fail_count ? RETRY_INTERVAL : UPDATE_INTERVAL)) {
     fetch_and_update_weather();
     last = millis();
   }
@@ -471,6 +508,12 @@ void create_ui() {
   lv_obj_set_style_text_font(lbl_forecast, get_font_12(), LV_PART_MAIN | LV_STATE_DEFAULT);
   lv_obj_set_style_text_color(lbl_forecast, lv_color_hex(0xe4ffff), LV_PART_MAIN | LV_STATE_DEFAULT);
   lv_obj_align(lbl_forecast, LV_ALIGN_TOP_LEFT, 20, 110);
+
+  lbl_updated = lv_label_create(scr);
+  lv_label_set_text(lbl_updated, "");
+  lv_obj_set_style_text_font(lbl_updated, get_font_12(), LV_PART_MAIN | LV_STATE_DEFAULT);
+  lv_obj_align(lbl_updated, LV_ALIGN_TOP_RIGHT, -20, 110);
+  update_freshness_label();
 
   box_daily = lv_obj_create(scr);
   lv_obj_set_size(box_daily, 220, 180);
@@ -1069,7 +1112,7 @@ void do_geocode_query(const char *q) {
 
   log_heap("before geocode");
   NetworkClientSecure client;
-  client.setCACert(OPEN_METEO_ROOT_CA);
+  client.setCACert(ISRG_ROOT_CAS);
   HTTPClient http;
   http.useHTTP10(true);  // no chunked encoding, so the stream can be parsed directly
   http.begin(client, url);
@@ -1089,7 +1132,19 @@ void do_geocode_query(const char *q) {
 }
 
 void fetch_and_update_weather() {
-  if (!ensure_wifi()) return;
+  if (fetch_weather()) {
+    last_weather_success_ms = millis();
+    if (last_weather_success_ms == 0) last_weather_success_ms = 1;
+    weather_fail_count = 0;
+  } else if (weather_fail_count < 255) {
+    weather_fail_count++;
+  }
+  update_freshness_label();
+}
+
+bool fetch_weather() {
+  if (!ensure_wifi()) return false;
+  bool ok = false;
 
 
   String url = String("https://api.open-meteo.com/v1/forecast?latitude=")
@@ -1102,7 +1157,7 @@ void fetch_and_update_weather() {
 
   log_heap("before weather fetch");
   NetworkClientSecure client;
-  client.setCACert(OPEN_METEO_ROOT_CA);
+  client.setCACert(ISRG_ROOT_CAS);
   HTTPClient http;
   http.useHTTP10(true);  // no chunked encoding, so the stream can be parsed directly
   http.begin(client, url);
@@ -1196,6 +1251,7 @@ void fetch_and_update_weather() {
         lv_label_set_text_fmt(lbl_hourly_temp[i], "%.0f°%c", temp, unit);
         lv_img_set_src(img_hourly[i], choose_icon(hourly_weather_codes[i].as<int>(), hourly_is_day[i].as<int>()));
       }
+      ok = true;
 
 
     } else {
@@ -1205,6 +1261,7 @@ void fetch_and_update_weather() {
     Serial.println("HTTP GET failed at " + url);
   }
   http.end();
+  return ok;
 }
 
 const lv_img_dsc_t* choose_image(int code, int is_day) {

@@ -1,9 +1,9 @@
-// Root CAs for open-meteo.com (Let's Encrypt). The forecast API chains to
-// ISRG Root X2 and the geocoding API to ISRG Root X1, so both are pinned.
+// Let's Encrypt root CAs. The open-meteo forecast API chains to ISRG Root X2;
+// the open-meteo geocoding API and api.weather.gov chain to ISRG Root X1.
 // X1 expires 2035-06-04, X2 expires 2040-09-17.
 #pragma once
 
-static const char OPEN_METEO_ROOT_CA[] =
+static const char ISRG_ROOT_CAS[] =
   "-----BEGIN CERTIFICATE-----\n"
   "MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw\n"
   "TzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2Vh\n"
