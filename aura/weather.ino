@@ -129,7 +129,8 @@ static lv_obj_t *lbl_hourly[7];
 static lv_obj_t *lbl_precipitation_probability[7];
 static lv_obj_t *lbl_hourly_temp[7];
 static lv_obj_t *img_hourly[7];
-#define NOW_ROWS 7
+#define NOW_ROWS 8
+#define NOW_ROW_AQI 7
 static lv_obj_t *box_now;
 static lv_obj_t *lbl_now_name[NOW_ROWS];
 static lv_obj_t *lbl_now_value[NOW_ROWS];
@@ -674,20 +675,20 @@ void create_ui() {
 
   const char *now_names[NOW_ROWS] = {
     strings->wind, strings->gusts, strings->humidity, strings->uv_index,
-    strings->precip_today, strings->sunrise, strings->sunset
+    strings->precip_today, strings->sunrise, strings->sunset, strings->air_quality
   };
   for (int i = 0; i < NOW_ROWS; i++) {
     lbl_now_name[i] = lv_label_create(box_now);
     lv_label_set_text(lbl_now_name[i], now_names[i]);
     lv_obj_set_style_text_color(lbl_now_name[i], lv_color_hex(0xb9ecff), LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_font(lbl_now_name[i], get_font_16(), LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_align(lbl_now_name[i], LV_ALIGN_TOP_LEFT, 2, i * 24);
+    lv_obj_align(lbl_now_name[i], LV_ALIGN_TOP_LEFT, 2, i * 20);
 
     lbl_now_value[i] = lv_label_create(box_now);
     lv_label_set_text(lbl_now_value[i], "--");
     lv_obj_add_style(lbl_now_value[i], &default_label_style, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_font(lbl_now_value[i], get_font_16(), LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_align(lbl_now_value[i], LV_ALIGN_TOP_RIGHT, 0, i * 24);
+    lv_obj_align(lbl_now_value[i], LV_ALIGN_TOP_RIGHT, 0, i * 20);
   }
 
 
@@ -1428,11 +1429,40 @@ void update_now_values(JsonDocument &doc, const LocalizedStrings *strings) {
   lv_label_set_text(lbl_now_value[6], format_iso_time(daily["sunset"][0], strings).c_str());
 }
 
+// US AQI from open-meteo's air quality API, coloured by EPA category
+void fetch_air_quality() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  char url[160];
+  snprintf(url, sizeof(url), "https://air-quality-api.open-meteo.com/v1/air-quality?latitude=%s&longitude=%s&current=us_aqi",
+           latitude, longitude);
+
+  NetworkClientSecure client;
+  client.setCACert(ISRG_ROOT_CAS);
+  HTTPClient http;
+  http.useHTTP10(true);
+  http.begin(client, url);
+  if (http.GET() == HTTP_CODE_OK) {
+    JsonDocument doc;
+    if (!deserializeJson(doc, http.getStream()) && doc["current"]["us_aqi"].is<int>()) {
+      int aqi = doc["current"]["us_aqi"];
+      uint32_t color = aqi <= 50 ? 0x7cfc00 : aqi <= 100 ? 0xffe14d : aqi <= 150 ? 0xffa040
+                     : aqi <= 200 ? 0xff5a5a : aqi <= 300 ? 0xd08cff : 0xff8080;
+      lv_label_set_text_fmt(lbl_now_value[NOW_ROW_AQI], "%d", aqi);
+      lv_obj_set_style_text_color(lbl_now_value[NOW_ROW_AQI], lv_color_hex(color), LV_PART_MAIN | LV_STATE_DEFAULT);
+      Serial.printf("Air quality: US AQI %d\n", aqi);
+    }
+  } else {
+    Serial.println("Air quality fetch failed");
+  }
+  http.end();
+}
+
 void fetch_and_update_weather() {
   if (fetch_weather()) {
     last_weather_success_ms = millis();
     if (last_weather_success_ms == 0) last_weather_success_ms = 1;
     weather_fail_count = 0;
+    fetch_air_quality();
   } else if (weather_fail_count < 255) {
     weather_fail_count++;
   }

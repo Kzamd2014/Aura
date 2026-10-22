@@ -46,6 +46,7 @@ struct LocalizedStrings {
   const char* precip_today;
   const char* night_start;
   const char* night_end;
+  const char* air_quality;
 };
 
 #define DEFAULT_CAPTIVE_SSID "Aura"
@@ -79,7 +80,8 @@ static const LocalizedStrings strings_en = {
   "Dim screen at night",
   "Updated",
   "CURRENT CONDITIONS", "Wind", "Gusts", "Humidity", "UV index", "Sunrise", "Sunset", "Precip. today",
-  "Start:", "End:"
+  "Start:", "End:",
+  "Air quality"
 };
 
 static const LocalizedStrings strings_es = {
@@ -113,7 +115,8 @@ static const LocalizedStrings strings_es = {
   "Pantalla noche",
   "Actualizado",
   "CONDICIONES ACTUALES", "Viento", "Ráfagas", "Humedad", "Índice UV", "Amanecer", "Atardecer", "Precip. hoy",
-  "Inicio:", "Fin:"
+  "Inicio:", "Fin:",
+  "Calidad aire"
 };
 
 static const LocalizedStrings strings_de = {
@@ -149,7 +152,8 @@ static const LocalizedStrings strings_de = {
   "Nacht-Dimmen",
   "Aktualisiert",
   "AKTUELLES WETTER", "Wind", "Böen", "Luftfeuchte", "UV-Index", "Sonnenaufgang", "Sonnenuntergang", "Niederschlag",
-  "Beginn:", "Ende:"
+  "Beginn:", "Ende:",
+  "Luftqualität"
 };
 
 static const LocalizedStrings strings_fr = {
@@ -185,7 +189,8 @@ static const LocalizedStrings strings_fr = {
   "Nuit écran",
   "Mis à jour",
   "CONDITIONS ACTUELLES", "Vent", "Rafales", "Humidité", "Indice UV", "Lever du soleil", "Coucher du soleil", "Précip. auj.",
-  "Début:", "Fin:"
+  "Début:", "Fin:",
+  "Qualité air"
 };
 
 static const LocalizedStrings strings_tr = {
@@ -218,7 +223,8 @@ static const LocalizedStrings strings_tr = {
   "Gece kısık",
   "Güncellendi",
   "MEVCUT KOŞULLAR", "Rüzgar", "Ani rüzgar", "Nem", "UV indeksi", "Gün doğumu", "Gün batımı", "Yağış bugün",
-  "Başla:", "Bitiş:"
+  "Başla:", "Bitiş:",
+  "Hava kalitesi"
 };
 
 static const LocalizedStrings strings_sv = {
@@ -255,7 +261,8 @@ static const LocalizedStrings strings_sv = {
   "Nattdämpning",
   "Uppdaterad",
   "AKTUELLT VÄDER", "Vind", "Vindbyar", "Luftfuktighet", "UV-index", "Soluppgång", "Solnedgång", "Nederbörd idag",
-  "Start:", "Slut:"
+  "Start:", "Slut:",
+  "Luftkvalitet"
 };
 
 static const LocalizedStrings strings_it = {
@@ -287,7 +294,8 @@ static const LocalizedStrings strings_it = {
   "Schermo notte",
   "Aggiornato",
   "CONDIZIONI ATTUALI", "Vento", "Raffiche", "Umidità", "Indice UV", "Alba", "Tramonto", "Precip. oggi",
-  "Inizio:", "Fine:"
+  "Inizio:", "Fine:",
+  "Qualità aria"
 };
 
 static const LocalizedStrings* get_strings(Language current_language) {
