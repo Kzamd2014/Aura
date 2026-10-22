@@ -36,9 +36,10 @@
 
 enum AlertLevel { ALERT_NONE, ALERT_MINOR, ALERT_MODERATE, ALERT_SEVERE, ALERT_EXTREME };
 
-// Night mode starts at 10pm and ends at 6am
+// Night mode defaults: 10pm to 6am, backlight off
 #define NIGHT_MODE_START_HOUR 22
 #define NIGHT_MODE_END_HOUR 6
+#define DEFAULT_BRIGHTNESS 255
 
 LV_FONT_DECLARE(lv_font_montserrat_latin_12);
 LV_FONT_DECLARE(lv_font_montserrat_latin_14);
@@ -79,6 +80,14 @@ static Preferences prefs;
 static bool use_fahrenheit = false;
 static bool use_24_hour = false; 
 static bool use_night_mode = false;
+static uint32_t brightness_setting = DEFAULT_BRIGHTNESS;
+static uint8_t night_start_hour = NIGHT_MODE_START_HOUR;
+static uint8_t night_end_hour = NIGHT_MODE_END_HOUR;
+static uint32_t night_brightness = 0;  // 0 = backlight off
+static lv_obj_t *night_win;
+static lv_obj_t *night_start_dd;
+static lv_obj_t *night_end_dd;
+static lv_obj_t *night_bright_slider;
 static char latitude[16] = LATITUDE_DEFAULT;
 static char longitude[16] = LONGITUDE_DEFAULT;
 static String location = String(LOCATION_DEFAULT);
@@ -204,6 +213,7 @@ void create_settings_window();
 static void screen_event_cb(lv_event_t *e);
 static void alert_banner_cb(lv_event_t *e);
 void next_page_cb(lv_event_t *e);
+void create_night_dialog();
 void update_page_dots();
 static void page_changed_cb(lv_event_t *e);
 static void settings_event_handler(lv_event_t *e);
@@ -351,7 +361,7 @@ void touchscreen_read(lv_indev_t *indev, lv_indev_data_t *data) {
     // Handle touch during dimmed screen
     if (night_mode_active) {
       // Temporarily wake the screen for 15 seconds
-      analogWrite(LCD_BACKLIGHT_PIN, prefs.getUInt("brightness", 128));
+      analogWrite(LCD_BACKLIGHT_PIN, brightness_setting);
     
       if (temp_screen_wakeup_timer) {
         lv_timer_del(temp_screen_wakeup_timer);
@@ -408,10 +418,13 @@ void setup() {
   use_fahrenheit = prefs.getBool("useFahrenheit", false);
   location = prefs.getString("location", LOCATION_DEFAULT);
   use_night_mode = prefs.getBool("useNightMode", false);
-  uint32_t brightness = prefs.getUInt("brightness", 255);
+  brightness_setting = prefs.getUInt("brightness", DEFAULT_BRIGHTNESS);
+  night_start_hour = prefs.getUChar("nightStart", NIGHT_MODE_START_HOUR);
+  night_end_hour = prefs.getUChar("nightEnd", NIGHT_MODE_END_HOUR);
+  night_brightness = prefs.getUInt("nightBright", 0);
   use_24_hour = prefs.getBool("use24Hour", false);
   current_language = (Language)prefs.getUInt("language", LANG_EN);
-  analogWrite(LCD_BACKLIGHT_PIN, brightness);
+  analogWrite(LCD_BACKLIGHT_PIN, brightness_setting);
 
   // Check for Wi-Fi config and request it if not available
   generate_ap_password();
@@ -886,6 +899,83 @@ static void reset_confirm_no_cb(lv_event_t *e) {
   lv_obj_del(mbox);
 }
 
+static lv_obj_t *add_hour_dropdown(lv_obj_t *cont, lv_obj_t *label, uint8_t selected) {
+  String opts;
+  for (int h = 0; h < 24; h++) {
+    if (h) opts += "\n";
+    opts += hour_of_day(h);
+  }
+  lv_obj_t *dd = lv_dropdown_create(cont);
+  lv_dropdown_set_options(dd, opts.c_str());
+  lv_dropdown_set_selected(dd, selected);
+  lv_obj_set_width(dd, 100);
+  lv_obj_set_style_text_font(dd, get_font_14(), LV_PART_MAIN | LV_STATE_DEFAULT);
+  lv_obj_set_style_text_font(lv_dropdown_get_list(dd), get_font_14(), LV_PART_MAIN | LV_STATE_DEFAULT);
+  lv_obj_align_to(dd, label, LV_ALIGN_OUT_RIGHT_MID, 10, 0);
+  return dd;
+}
+
+// Night mode hours and how bright the screen stays during them
+void create_night_dialog() {
+  if (night_win) return;
+  const LocalizedStrings *strings = get_strings(current_language);
+  night_win = lv_win_create(lv_scr_act());
+  lv_obj_t *title = lv_win_add_title(night_win, strings->use_night_mode);
+  lv_obj_set_style_height(lv_win_get_header(night_win), 30, 0);
+  lv_obj_set_style_text_font(title, get_font_16(), 0);
+  lv_obj_set_style_margin_left(title, 10, 0);
+  lv_obj_set_size(night_win, 240, 320);
+  lv_obj_center(night_win);
+
+  lv_obj_t *cont = lv_win_get_content(night_win);
+
+  lv_obj_t *lbl_start = lv_label_create(cont);
+  lv_label_set_text(lbl_start, strings->night_start);
+  lv_obj_set_style_text_font(lbl_start, get_font_14(), LV_PART_MAIN | LV_STATE_DEFAULT);
+  lv_obj_align(lbl_start, LV_ALIGN_TOP_LEFT, 5, 15);
+  night_start_dd = add_hour_dropdown(cont, lbl_start, night_start_hour);
+
+  lv_obj_t *lbl_end = lv_label_create(cont);
+  lv_label_set_text(lbl_end, strings->night_end);
+  lv_obj_set_style_text_font(lbl_end, get_font_14(), LV_PART_MAIN | LV_STATE_DEFAULT);
+  lv_obj_align(lbl_end, LV_ALIGN_TOP_LEFT, 5, 65);
+  night_end_dd = add_hour_dropdown(cont, lbl_end, night_end_hour);
+  // Line the two dropdowns up whichever label is longer
+  lv_obj_align(night_start_dd, LV_ALIGN_TOP_LEFT, 90, 5);
+  lv_obj_align(night_end_dd, LV_ALIGN_TOP_LEFT, 90, 55);
+
+  lv_obj_t *lbl_b = lv_label_create(cont);
+  lv_label_set_text(lbl_b, strings->brightness);
+  lv_obj_set_style_text_font(lbl_b, get_font_14(), LV_PART_MAIN | LV_STATE_DEFAULT);
+  lv_obj_align(lbl_b, LV_ALIGN_TOP_LEFT, 5, 115);
+
+  // Leftmost position turns the backlight off, as before
+  night_bright_slider = lv_slider_create(cont);
+  lv_slider_set_range(night_bright_slider, 0, 128);
+  lv_slider_set_value(night_bright_slider, night_brightness, LV_ANIM_OFF);
+  lv_obj_set_width(night_bright_slider, 180);
+  lv_obj_align(night_bright_slider, LV_ALIGN_TOP_LEFT, 10, 145);
+
+  lv_obj_t *btn_close = lv_btn_create(cont);
+  lv_obj_set_size(btn_close, 80, 40);
+  lv_obj_align(btn_close, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+  lv_obj_add_event_cb(btn_close, [](lv_event_t *e) {
+    night_start_hour = lv_dropdown_get_selected(night_start_dd);
+    night_end_hour = lv_dropdown_get_selected(night_end_dd);
+    night_brightness = lv_slider_get_value(night_bright_slider);
+    prefs.putUChar("nightStart", night_start_hour);
+    prefs.putUChar("nightEnd", night_end_hour);
+    prefs.putUInt("nightBright", night_brightness);
+    if (night_mode_active) activate_night_mode();  // apply a new night level immediately
+    lv_obj_del(night_win);
+    night_win = nullptr;
+  }, LV_EVENT_CLICKED, NULL);
+  lv_obj_t *lbl_close = lv_label_create(btn_close);
+  lv_label_set_text(lbl_close, strings->close);
+  lv_obj_set_style_text_font(lbl_close, get_font_14(), LV_PART_MAIN | LV_STATE_DEFAULT);
+  lv_obj_center(lbl_close);
+}
+
 static void change_location_event_cb(lv_event_t *e) {
   if (location_win) return;
 
@@ -989,17 +1079,19 @@ void create_settings_window() {
   lv_obj_align(lbl_b, LV_ALIGN_TOP_LEFT, 0, 5);
   lv_obj_t *slider = lv_slider_create(cont);
   lv_slider_set_range(slider, 1, 255);
-  uint32_t saved_b = prefs.getUInt("brightness", 128);
-  lv_slider_set_value(slider, saved_b, LV_ANIM_OFF);
+  lv_slider_set_value(slider, brightness_setting, LV_ANIM_OFF);
   lv_obj_set_width(slider, 100);
   lv_obj_align_to(slider, lbl_b, LV_ALIGN_OUT_RIGHT_MID, 10, 0);
 
   lv_obj_add_event_cb(slider, [](lv_event_t *e){
     lv_obj_t *s = (lv_obj_t*)lv_event_get_target(e);
-    uint32_t v = lv_slider_get_value(s);
-    analogWrite(LCD_BACKLIGHT_PIN, v);
-    prefs.putUInt("brightness", v);
+    brightness_setting = lv_slider_get_value(s);
+    analogWrite(LCD_BACKLIGHT_PIN, brightness_setting);
   }, LV_EVENT_VALUE_CHANGED, NULL);
+  // Save once when released rather than on every step of the drag
+  lv_obj_add_event_cb(slider, [](lv_event_t *e){
+    prefs.putUInt("brightness", brightness_setting);
+  }, LV_EVENT_RELEASED, NULL);
 
   // 'Night mode' switch
   lv_obj_t *lbl_night_mode = lv_label_create(cont);
@@ -1015,6 +1107,15 @@ void create_settings_window() {
     lv_obj_remove_state(night_mode_switch, LV_STATE_CHECKED);
   }
   lv_obj_add_event_cb(night_mode_switch, settings_event_handler, LV_EVENT_VALUE_CHANGED, NULL);
+
+  lv_obj_t *btn_night = lv_btn_create(cont);
+  lv_obj_set_size(btn_night, 30, 25);
+  lv_obj_align_to(btn_night, night_mode_switch, LV_ALIGN_OUT_RIGHT_MID, 8, 0);
+  lv_obj_add_event_cb(btn_night, [](lv_event_t *e) { create_night_dialog(); }, LV_EVENT_CLICKED, NULL);
+  lv_obj_t *lbl_gear = lv_label_create(btn_night);
+  lv_label_set_text(lbl_gear, LV_SYMBOL_SETTINGS);
+  lv_obj_set_style_text_font(lbl_gear, get_font_12(), LV_PART_MAIN | LV_STATE_DEFAULT);
+  lv_obj_center(lbl_gear);
 
   // 'Use F' switch
   lv_obj_t *lbl_u = lv_label_create(cont);
@@ -1156,6 +1257,7 @@ static void settings_event_handler(lv_event_t *e) {
     // Recreate the main UI with the new language
     lv_obj_clean(lv_scr_act());
     kb = nullptr;  // was a child of the screen, so lv_obj_clean deleted it
+    night_win = nullptr;
     create_ui();
     fetch_and_update_weather();
     return;
@@ -1186,16 +1288,20 @@ bool night_mode_should_be_active() {
   if (!getLocalTime(&timeinfo, 0)) return false;
   
   int hour = timeinfo.tm_hour;
-  return (hour >= NIGHT_MODE_START_HOUR || hour < NIGHT_MODE_END_HOUR);
+  if (night_start_hour == night_end_hour) return false;
+  if (night_start_hour < night_end_hour) {
+    return hour >= night_start_hour && hour < night_end_hour;
+  }
+  return hour >= night_start_hour || hour < night_end_hour;  // wraps past midnight
 }
 
 void activate_night_mode() {
-  analogWrite(LCD_BACKLIGHT_PIN, 0);
+  analogWrite(LCD_BACKLIGHT_PIN, night_brightness);
   night_mode_active = true;
 }
 
 void deactivate_night_mode() {
-  analogWrite(LCD_BACKLIGHT_PIN, prefs.getUInt("brightness", 128));
+  analogWrite(LCD_BACKLIGHT_PIN, brightness_setting);
   night_mode_active = false;
 }
 
